@@ -55,7 +55,7 @@ type resultNoSpeed struct {
 
 type resultAddSpeed struct {
 	resultNoSpeed
-	downloadSpeed float64 // 下载速度
+	downSpeed float64 // 下载速度
 }
 
 type location struct {
@@ -301,6 +301,74 @@ func speedOnce(ip string) float64 {
 	return speed
 }
 
+// speedTests 对已经通过延迟测试的IP进行下载速度测试
+// 它使用goroutine并发进行测速，并通过channel返回结果
+// 过程中，调用reportProgress报告测试进度
+func speedTests(resultChan chan resultNoSpeed) []resultAddSpeed {
+	var wg sync.WaitGroup
+	thread := make(chan struct{}, *maxThreads)
+
+	// 创建 speedResultsChan 通道，用于存储 speedtestresult 结构体
+	speedResultsChan := make(chan resultAddSpeed, len(resultChan))
+
+	// 创建 progressChan 和 doneChan 通道，启动 reportProgress 函数，用于报告进度
+	progressChan := make(chan int, 1)
+	doneChan := make(chan struct{})
+	go reportProgress(progressChan, len(resultChan), doneChan)
+
+	// 遍历 resultChan 通道，对每个结果进行处理
+	for res := range resultChan {
+		wg.Add(1)
+		thread <- struct{}{}
+		go func(res resultNoSpeed) {
+			defer func() {
+				<-thread
+				wg.Done()
+			}()
+
+			// 测速，结果发送到 speedResultsChan 通道
+			downloadSpeed := speedOnce(res.ip)
+			speedResultsChan <- resultAddSpeed{resultNoSpeed: res, downSpeed: downloadSpeed}
+
+			// 进度+1
+			progressChan <- 1
+		}(res)
+	}
+
+	// 等待所有任务完成
+	timef("正在等待 测速 结束...\n")
+	go func() {
+		wg.Wait()
+		close(speedResultsChan)
+		close(progressChan)
+	}()
+
+	// 等待 reportProgress 函数完成
+	<-doneChan
+
+	timef("测速已结束，正在统计数据...\n")
+	var results []resultAddSpeed
+	for speedResult := range speedResultsChan {
+		results = append(results, speedResult)
+	}
+
+	return results
+}
+
+func reportProgress(progressChan chan int, total int, doneChan chan struct{}) {
+	currentCount := 0
+	for count := range progressChan {
+		currentCount += count
+		percentage := float64(currentCount) / float64(total) * 100
+		timef("已完成: %.2f%%\r", percentage)
+		if currentCount == total {
+			timef("已完成: %.2f%%\n", percentage)
+			break
+		}
+	}
+	doneChan <- struct{}{}
+}
+
 func main() {
 	flag.Parse()
 
@@ -443,47 +511,17 @@ func main() {
 		fmt.Println("没有发现有效的IP")
 		return
 	}
+
 	var results []resultAddSpeed
 	if *doSpeedTest > 0 {
-		fmt.Printf("开始测速\n")
-		var wg2 sync.WaitGroup
-		wg2.Add(*doSpeedTest)
-		count = 0
-		total := len(resultChan)
-		results = []resultAddSpeed{}
-		for i := 0; i < *doSpeedTest; i++ {
-			thread <- struct{}{}
-			go func() {
-				defer func() {
-					<-thread
-					wg2.Done()
-				}()
-				for res := range resultChan {
-
-					downloadSpeed := speedOnce(res.ip)
-					results = append(results, resultAddSpeed{resultNoSpeed: res, downloadSpeed: downloadSpeed})
-
-					count++
-					percentage := float64(count) / float64(total) * 100
-					fmt.Printf("已完成: %.2f%%\r", percentage)
-					if count == total {
-						fmt.Printf("已完成: %.2f%%\033[0\n", percentage)
-					}
-				}
-			}()
-		}
-		wg2.Wait()
+		results := speedTests(resultChan)
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].downSpeed > results[j].downSpeed
+		})
 	} else {
 		for res := range resultChan {
 			results = append(results, resultAddSpeed{resultNoSpeed: res})
 		}
-	}
-
-	if *doSpeedTest > 0 {
-		sort.Slice(results, func(i, j int) bool {
-			return results[i].downloadSpeed > results[j].downloadSpeed
-		})
-	} else {
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].resultNoSpeed.tcpRTT < results[j].resultNoSpeed.tcpRTT
 		})
@@ -504,7 +542,7 @@ func main() {
 	}
 	for _, res := range results {
 		if *doSpeedTest > 0 {
-			writer.Write([]string{res.resultNoSpeed.ip, strconv.Itoa(res.resultNoSpeed.port), strconv.FormatBool(*forceTLS), res.resultNoSpeed.dataCenter, res.resultNoSpeed.region, res.resultNoSpeed.city, fmt.Sprintf("%d ms", res.resultNoSpeed.tcpRTT), fmt.Sprintf("%.0f kB/s", res.downloadSpeed)})
+			writer.Write([]string{res.resultNoSpeed.ip, strconv.Itoa(res.resultNoSpeed.port), strconv.FormatBool(*forceTLS), res.resultNoSpeed.dataCenter, res.resultNoSpeed.region, res.resultNoSpeed.city, fmt.Sprintf("%d ms", res.resultNoSpeed.tcpRTT), fmt.Sprintf("%.0f kB/s", res.downSpeed)})
 		} else {
 			writer.Write([]string{res.resultNoSpeed.ip, strconv.Itoa(res.resultNoSpeed.port), strconv.FormatBool(*forceTLS), res.resultNoSpeed.dataCenter, res.resultNoSpeed.region, res.resultNoSpeed.city, fmt.Sprintf("%d ms", res.resultNoSpeed.tcpRTT)})
 		}
