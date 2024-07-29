@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -23,34 +25,46 @@ import (
 )
 
 const (
-	tcpTimeout       = 1 * time.Second                      // TCP连接超时时间
-	httpTimeout      = 2 * time.Second                      // HTTP请求超时时间
-	downloadDuration = 5 * time.Second                      // 最长下载持续时间
-	traceURL         = "speed.cloudflare.com/cdn-cgi/trace" // Cloudflare trace URL
-	UA               = "Mozilla/5.0"                        // User-Agent
-	limitCIDR        = 1024                                 // 单条CIDR最大长度限制
+	tcpTimeout       = 1 * time.Second                              // TCP连接超时时间
+	httpTimeout      = 2 * time.Second                              // HTTP请求超时时间
+	downloadDuration = 5 * time.Second                              // 最长下载持续时间
+	traceURL         = "https://speed.cloudflare.com/cdn-cgi/trace" // Cloudflare trace URL
+	UA               = "Mozilla/5.0"                                // User-Agent
+	limitCIDR        = 1024                                         // 单条CIDR最大长度限制
 )
 
 var (
-	ipFile       = flag.String("ipin", "ip.txt", "IP地址文件名称")                                   // IP地址文件名称
-	outFile      = flag.String("outfile", "ip.csv", "输出文件名称")                                  // 输出文件名称
-	tcpPort      = flag.Int("tcport", 443, "端口")                                               // 端口
-	maxThreads   = flag.Int("th", 100, "并发请求最大协程数")                                            // 最大协程数
-	doSpeedTest  = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")                                     // 下载测速协程数量
-	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
-	forceTLS     = flag.Bool("tls", false, "是否强制启用TLS")                                        // TLS是否启用
-	maxAttempt   = flag.Int("attempt", 5, "最大重试次数")                                            // 各项测试最大重试次数
-	ipCounts     = 0                                                                           // 存储读入的ip总数
-	startTime    = time.Now()
+	ipFile        = flag.String("ipin", "ip.txt", "IP地址文件名称")                                           // IP地址文件名称
+	outFilePrefix = flag.String("xout", "result", "输出文件前缀")                                             // 输出文件前缀
+	tcpPort       = flag.Int("tcport", 443, "端口")                                                       // 端口
+	maxThreads    = flag.Int("th", 100, "并发请求最大协程数")                                                    // 最大协程数
+	doSpeedTest   = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")                                             // 下载测速协程数量
+	speedTestURL  = flag.String("url", "https://speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
+	originTestURL = flag.String("origin", "", "回源测试地址，默认留空禁用")                                          // 回源测试地址
+	forceTLS      = flag.Bool("tls", false, "是否强制启用TLS")                                                // TLS是否启用
+	maxAttempt    = flag.Int("attempt", 5, "最大重试次数")                                                    // 各项测试最大重试次数
+	ipCounts      = 0                                                                                   // 存储读入的ip总数
+	startTime     = time.Now()                                                                          // 记录程序开始运行的时间
 )
 
-type resultNoSpeed struct {
+type resultTCP struct {
 	ip         string        // IP地址
 	port       int           // 端口
+	tcpReach   int           // TCP请求成功次数
+	reachRatio float64       // TCP请求成功率
+	tcpRTTsum  time.Duration // TCP请求延迟总和
+	tcpRTTmin  time.Duration // TCP请求最小延迟
+	tcpRTTavg  time.Duration // TCP请求平均延迟
+	tcpRTTmax  time.Duration // TCP请求最大延迟
+}
+
+type resultNoSpeed struct {
+	resultTCP
 	dataCenter string        // 数据中心
 	region     string        // 地区
 	city       string        // 城市
-	tcpRTT     time.Duration // TCP请求延迟
+	httpRTT    time.Duration // HTTP请求延迟
+	originRTT  time.Duration // 回源测试延迟
 }
 
 type resultAddSpeed struct {
@@ -246,58 +260,298 @@ func readIPs(filepath string) ([]string, error) {
 	return ips, nil
 }
 
-// 测速函数
-func speedOnce(ip string) float64 {
-	var protocol string
-	if *forceTLS {
-		protocol = "https://"
-	} else {
-		protocol = "http://"
-	}
-	speedTestURL := protocol + *speedTestURL
-	// 创建请求
-	req, _ := http.NewRequest("GET", speedTestURL, nil)
-	req.Header.Set("User-Agent", UA)
+// tcpOnce执行一次TCP拨号并返回持续时间
+func tcpOnce(ip string) (time.Duration, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), tcpTimeout)
+	defer cancel()
 
-	// 创建TCP连接
 	dialer := &net.Dialer{
-		Timeout:   downloadDuration,
-		KeepAlive: 0,
+		Timeout:   tcpTimeout,
+		KeepAlive: 0, // 不保留链接，每次请求都建立一个新的TCP连接
 	}
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
+
+	// 使用自定义拨号器拨号
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	defer conn.Close()
 
-	fmt.Printf("正在测试IP %s 端口 %s\n", ip, strconv.Itoa(*tcpPort))
-	startTime := time.Now()
-	// 创建HTTP客户端
-	client := http.Client{
-		Transport: &http.Transport{
-			Dial: func(network, addr string) (net.Conn, error) {
-				return conn, nil
-			},
-		},
-		//设置单个IP测速最长时间为5秒
-		Timeout: 5 * time.Second,
+	return time.Since(start), nil
+}
+
+// 对 IP 集合执行多轮 TCP 测试
+func tcpTests(ips []string) ([]resultTCP, []string) {
+	var wg sync.WaitGroup
+	thread := make(chan struct{}, *maxThreads)
+
+	timef("开始执行 TCP连通性 测试, 共 %d 个目标\n", len(ips))
+
+	// 初始化用于统计的 map
+	tcpStats := make(map[string]*resultTCP)
+	var mu sync.Mutex // 保护 tcpStats 的互斥锁
+
+	for attempts := 0; attempts < *maxAttempt; attempts++ {
+		for _, ip := range ips {
+			thread <- struct{}{}
+			wg.Add(1)
+			go func(ip string, attempts int) {
+				defer func() {
+					<-thread
+					wg.Done()
+				}()
+
+				tcpRTT, err := tcpOnce(ip)
+				mu.Lock() // 加锁
+				if err == nil {
+					if _, exists := tcpStats[ip]; !exists {
+						tcpStats[ip] = &resultTCP{
+							ip:        ip,
+							port:      *tcpPort,
+							tcpRTTmin: time.Duration(math.MaxInt64), // 初始化为最大值
+						}
+					}
+
+					stats := tcpStats[ip]
+					stats.tcpReach++
+					if tcpRTT < stats.tcpRTTmin {
+						stats.tcpRTTmin = tcpRTT
+					}
+					if tcpRTT > stats.tcpRTTmax {
+						stats.tcpRTTmax = tcpRTT
+					}
+					stats.tcpRTTsum += tcpRTT
+				} else {
+					fmt.Printf("[%s] TCP连接失败(第%d次): %v\n", ip, attempts+1, err)
+				}
+				mu.Unlock() // 解锁
+			}(ip, attempts)
+		}
 	}
-	// 发送请求
+
+	timef("正在等待 TCP 测试结束...\n")
+	wg.Wait()
+
+	timef("TCP 测试已结束，正在统计数据...\n")
+	resultAlive := []resultTCP{}
+	resultDead := []string{}
+	for _, stats := range tcpStats {
+		if stats.tcpReach > 0 {
+			stats.tcpRTTavg = stats.tcpRTTsum / time.Duration(stats.tcpReach)
+			stats.reachRatio = float64(stats.tcpReach) / float64(*maxAttempt) * 100
+			resultAlive = append(resultAlive, *stats)
+		} else {
+			resultDead = append(resultDead, stats.ip)
+		}
+	}
+
+	return resultAlive, resultDead
+}
+
+// genURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
+func genURL(oriURL string) (string, int) {
+	if strings.HasPrefix(oriURL, "https://") || *forceTLS {
+		return "https://" + strings.TrimPrefix(oriURL, "https://"), 443
+	}
+	if strings.HasPrefix(oriURL, "http://") {
+		return oriURL, 80
+	}
+	return "http://" + oriURL, 80
+}
+
+// 公共函数，用于创建 HTTP 客户端和请求
+func genClient(ip string, port int, url string) (*http.Client, *http.Request, error) {
+	// 创建一个用于拨号的结构体
+	dialer := &net.Dialer{
+		Timeout:   tcpTimeout, // 设置超时时间
+		KeepAlive: 0,          // 关闭 keepalive
+	}
+	// 创建一个 http 传输结构体
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// 使用拨号结构体连接到指定的 ip 和端口
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+		},
+	}
+	// 创建一个 http 客户端
+	client := &http.Client{
+		Transport: transport,   // 设置传输结构体
+		Timeout:   httpTimeout, // 设置超时时间
+	}
+	// 创建一个 http 请求
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 设置请求头
+	req.Header.Set("User-Agent", UA)
+	// 关闭请求
 	req.Close = true
+	return client, req, nil
+}
+
+// httpTraceOnce 执行官方节点测试并返回持续时间
+func httpTraceOnce(ip string) (time.Duration, *bytes.Buffer, error) {
+	URL, port := genURL(traceURL)
+	for attempts := 0; attempts < *maxAttempt; attempts++ {
+		startTime := time.Now()
+
+		client, req, err := genClient(ip, port, URL)
+		if err != nil {
+			return 0, nil, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if os.IsTimeout(err) {
+				fmt.Printf("[%s] trace请求(第%d次)超时: %v\n", ip, attempts+1, err)
+			} else {
+				fmt.Printf("[%s] trace请求(第%d次)失败: %v\n", ip, attempts+1, err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		duration := time.Since(startTime)
+		buf := &bytes.Buffer{}
+		_, err = io.Copy(buf, resp.Body)
+		if err != nil {
+			fmt.Printf("[%s] trace请求(第%d次)读取响应体失败: %v\n", ip, attempts+1, err)
+			continue
+		}
+
+		return duration, buf, nil
+	}
+	return 0, nil, fmt.Errorf("[%s] trace请求全部超时", ip)
+}
+
+// httpOriginOnce 执行回源时间测试并返回持续时间
+func httpOriginOnce(ip string) (time.Duration, error) {
+	URL, port := genURL(*originTestURL)
+	for attempts := 0; attempts < *maxAttempt; attempts++ {
+		startTime := time.Now()
+		client, req, err := genClient(ip, port, URL)
+		if err != nil {
+			return 0, err
+		}
+		req.Body = http.NoBody // 不关注响应，设置请求体为空
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if os.IsTimeout(err) {
+				fmt.Printf("[%s] 回源请求(第%d次)超时: %v\n", ip, attempts+1, err)
+			} else {
+				fmt.Printf("[%s] 回源请求(第%d次)失败: %v\n", ip, attempts+1, err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		duration := time.Since(startTime)
+		return duration, nil
+	}
+	return 0, fmt.Errorf("[%s] 回源请求全部超时", ip)
+}
+
+// HTTP 和回源测试部分
+func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan resultNoSpeed {
+	var wg sync.WaitGroup
+	thread := make(chan struct{}, *maxThreads)
+	resultHTTPChan := make(chan resultNoSpeed, len(tcpResults))
+
+	re := regexp.MustCompile(`colo=([A-Z]+)`)
+
+	timef("开始执行 HTTP和回源 测试\n")
+	for _, res := range tcpResults {
+		thread <- struct{}{}
+		wg.Add(1)
+		go func(res resultTCP) {
+			defer func() {
+				<-thread
+				wg.Done()
+			}()
+
+			// HTTP 测试
+			httpRTT, body, err := httpTraceOnce(res.ip)
+			if err != nil {
+				fmt.Printf("HTTP测试失败: %v\n", err)
+				return
+			}
+
+			// 回源测试
+			originRTT := time.Duration(0)
+			if *originTestURL != "" {
+				originRTT, err = httpOriginOnce(res.ip)
+				if err != nil {
+					fmt.Printf("回源测试失败: %v\n", err)
+					return
+				}
+			}
+
+			var dataCenter, region, city string
+			if matches := re.FindStringSubmatch(body.String()); len(matches) > 1 {
+				Colo := matches[1]
+				if loc, ok := locationMap[Colo]; ok {
+					dataCenter = Colo
+					region = loc.Region
+					city = loc.City
+				} else {
+					timef("未找到数据中心 %s 的位置信息\n", Colo)
+					dataCenter = Colo
+				}
+			}
+
+			fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms, HTTP-RTT %d ms，回源RTT %d ms，数据中心: %s, 地区: %s, 城市: %s\n",
+				res.ip, res.reachRatio, res.tcpRTTmin.Milliseconds(), res.tcpRTTavg.Milliseconds(),
+				res.tcpRTTmax.Milliseconds(), httpRTT.Milliseconds(), originRTT.Milliseconds(), dataCenter, region, city)
+
+			result := resultNoSpeed{
+				resultTCP:  res,
+				dataCenter: dataCenter,
+				region:     region,
+				city:       city,
+				httpRTT:    httpRTT,
+				originRTT:  originRTT,
+			}
+
+			resultHTTPChan <- result
+		}(res)
+	}
+
+	timef("正在等待 HTTP 测试结束...\n")
+	go func() {
+		wg.Wait()
+		close(resultHTTPChan)
+		timef("HTTP 测试已结束...\n")
+	}()
+
+	return resultHTTPChan
+}
+
+// 重构后的 speedOnce 函数
+func speedOnce(ip string) float64 {
+	URL, port := genURL(*speedTestURL)
+	client, req, err := genClient(ip, port, URL)
+	if err != nil {
+		return 0
+	}
+	// 修改 client 的超时时间为 downloadDuration
+	client.Timeout = downloadDuration
+
+	timef("正在使用 %s:%d 进行测速\n", ip, port)
+	startTime := time.Now()
+
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("IP %s 端口 %s 测速无效\n", ip, strconv.Itoa(*tcpPort))
+		timef("%s:%d 测速失败\n", ip, port)
 		return 0
 	}
 	defer resp.Body.Close()
 
-	// 复制响应体到/dev/null，并计算下载速度
 	written, _ := io.Copy(io.Discard, resp.Body)
 	duration := time.Since(startTime)
 	speed := float64(written) / duration.Seconds() / 1024
-
-	// 输出结果
-	fmt.Printf("IP %s 端口 %s 下载速度 %.0f kB/s\n", ip, strconv.Itoa(*tcpPort), speed)
 	return speed
 }
 
@@ -369,6 +623,53 @@ func reportProgress(progressChan chan int, total int, doneChan chan struct{}) {
 	doneChan <- struct{}{}
 }
 
+func resultsToCSV(results []resultAddSpeed, tcpDead []string, outFileName string) {
+	file, err := os.Create(outFileName)
+	if err != nil {
+		timef("无法创建文件: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 写入 CSV 头部
+	header := []string{"IP地址", "端口", "TLS", "数据中心", "地区", "城市",
+		"TCP Reach", "RTT min", "RTT avg", "RTT max", "HTTP RTT", "回源 RTT"}
+	if *doSpeedTest > 0 {
+		header = append(header, "下载速度")
+	}
+	writer.Write(header)
+
+	// 写入 CSV 记录
+	for _, res := range results {
+		// 有响应的记录
+		record := []string{
+			res.resultNoSpeed.ip,
+			strconv.Itoa(res.resultNoSpeed.port),
+			strconv.FormatBool(*forceTLS),
+			res.resultNoSpeed.dataCenter,
+			res.resultNoSpeed.region,
+			res.resultNoSpeed.city,
+			fmt.Sprintf("%.2f%%", res.resultNoSpeed.reachRatio),
+			fmt.Sprintf("%d", res.resultNoSpeed.tcpRTTmin.Milliseconds()),
+			fmt.Sprintf("%d", res.resultNoSpeed.tcpRTTavg.Milliseconds()),
+			fmt.Sprintf("%d", res.resultNoSpeed.tcpRTTmax.Milliseconds()),
+			fmt.Sprintf("%d", res.resultNoSpeed.httpRTT.Milliseconds()),
+			fmt.Sprintf("%d", res.resultNoSpeed.originRTT.Milliseconds()),
+		}
+		if *doSpeedTest > 0 {
+			record = append(record, fmt.Sprintf("%.0f kB/s", res.downSpeed))
+		}
+		writer.Write(record)
+	}
+	for _, ip := range tcpDead {
+		// 没得响应的记录
+		writer.Write([]string{ip, "", "", "", "", "", "不可达", "", "", "", ""})
+	}
+}
+
 func clearConsole() {
 	switch runtime.GOOS {
 	case "linux", "android", "darwin", "dragonfly", "freebsd", "netbsd", "openbsd", "illumos", "solaris":
@@ -398,18 +699,18 @@ func main() {
 	flag.Parse()
 
 	// 设置控制台运行标题
-	terminalTitle(fmt.Sprintf("[CFtester]%s>>%s", *ipFile, *outFile))
+	terminalTitle(fmt.Sprintf("[CFtester]%s>>%s", *ipFile, *outFilePrefix))
 
+	// 如果操作系统是 linux 增加最大打开文件数
 	osType := runtime.GOOS
 	if osType == "linux" {
-		// 尝试提升文件描述符的上限
-		fmt.Println("正在尝试提升文件描述符的上限...")
+		timef("正在尝试提升文件描述符的上限...\n")
 		cmd := exec.Command("bash", "-c", "ulimit -n 10000")
 		_, err := cmd.CombinedOutput()
 		if err != nil {
-			fmt.Printf("提升文件描述符上限时出现错误: %v\n", err)
+			timef("提升文件描述符上限时出现错误: %v\n", err)
 		} else {
-			fmt.Printf("文件描述符上限已提升!\n")
+			timef("文件描述符上限已提升!\n")
 		}
 	}
 
@@ -423,126 +724,24 @@ func main() {
 	// 加载地址库
 	locationMap, err := loadLocations()
 
-	var wg sync.WaitGroup
-	wg.Add(len(ips))
+	// TCP测试
+	tcpAlive, tcpDead := tcpTests(ips)
 
-	resultChan := make(chan resultNoSpeed, len(ips))
+	// HTTP和回源测试
+	resultChan := httpTests(tcpAlive, locationMap)
 
-	thread := make(chan struct{}, *maxThreads)
-
-	var count int
-	total := len(ips)
-
-	for _, ip := range ips {
-		thread <- struct{}{}
-		go func(ip string) {
-			defer func() {
-				<-thread
-				wg.Done()
-				count++
-				percentage := float64(count) / float64(total) * 100
-				fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\r", count, total, percentage)
-				if count == total {
-					fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\n", count, total, percentage)
-				}
-			}()
-
-			dialer := &net.Dialer{
-				Timeout:   tcpTimeout,
-				KeepAlive: 0,
-			}
-			start := time.Now()
-			conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-
-			tcpDuration := time.Since(start)
-			start = time.Now()
-
-			client := http.Client{
-				Transport: &http.Transport{
-					Dial: func(network, addr string) (net.Conn, error) {
-						return conn, nil
-					},
-				},
-				Timeout: tcpTimeout,
-			}
-
-			var protocol string
-			if *forceTLS {
-				protocol = "https://"
-			} else {
-				protocol = "http://"
-			}
-			requestURL := protocol + traceURL
-
-			req, _ := http.NewRequest("GET", requestURL, nil)
-
-			// 添加用户代理
-			req.Header.Set("User-Agent", UA)
-			req.Close = true
-			resp, err := client.Do(req)
-			if err != nil {
-				return
-			}
-
-			duration := time.Since(start)
-			if duration > httpTimeout {
-				return
-			}
-
-			body := &bytes.Buffer{}
-			// 创建一个读取操作的超时
-			timeout := time.After(httpTimeout)
-			// 使用一个 goroutine 来读取响应体
-			done := make(chan bool)
-			go func() {
-				_, err := io.Copy(body, resp.Body)
-				done <- true
-				if err != nil {
-					return
-				}
-			}()
-			// 等待读取操作完成或者超时
-			select {
-			case <-done:
-				// 读取操作完成
-			case <-timeout:
-				// 读取操作超时
-				return
-			}
-
-			if strings.Contains(body.String(), "uag=Mozilla/5.0") {
-				if matches := regexp.MustCompile(`colo=([A-Z]+)`).FindStringSubmatch(body.String()); len(matches) > 1 {
-					dataCenter := matches[1]
-					loc, ok := locationMap[dataCenter]
-					if ok {
-						fmt.Printf("发现有效IP %s 位置信息 %s 延迟 %d 毫秒\n", ip, loc.City, tcpDuration.Milliseconds())
-						resultChan <- resultNoSpeed{ip, *tcpPort, dataCenter, loc.Region, loc.City, tcpDuration}
-					} else {
-						fmt.Printf("发现有效IP %s 位置信息未知 延迟 %d 毫秒\n", ip, tcpDuration.Milliseconds())
-						resultChan <- resultNoSpeed{ip, *tcpPort, dataCenter, "", "", tcpDuration}
-					}
-				}
-			}
-		}(ip)
-	}
-
-	wg.Wait()
-	close(resultChan)
-
-	if len(resultChan) == 0 {
-		// 清除输出内容
-		fmt.Print("\033[2J")
-		fmt.Println("没有发现有效的IP")
-		return
-	}
+	// if len(resultChan) == 0 {
+	// 	// 清除输出内容
+	// 	fmt.Print("\033[2J")
+	// 	timef("没有发现有效的IP\n")
+	// 	return
+	// }
+	// 上面这个写法是错的，len(resultChan)返回的是通道的容量
 
 	var results []resultAddSpeed
 	if *doSpeedTest > 0 {
 		results := speedTests(resultChan)
+		// 根据下载速度排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].downSpeed > results[j].downSpeed
 		})
@@ -550,34 +749,19 @@ func main() {
 		for res := range resultChan {
 			results = append(results, resultAddSpeed{resultNoSpeed: res})
 		}
+		// 根据TCP平均RTT排序
 		sort.Slice(results, func(i, j int) bool {
-			return results[i].resultNoSpeed.tcpRTT < results[j].resultNoSpeed.tcpRTT
+			return results[i].resultNoSpeed.tcpRTTavg < results[j].resultNoSpeed.tcpRTTavg
 		})
 	}
 
-	file, err := os.Create(*outFile)
-	if err != nil {
-		fmt.Printf("无法创建文件: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	writer := csv.NewWriter(file)
-	if *doSpeedTest > 0 {
-		writer.Write([]string{"IP地址", "端口", "TLS", "数据中心", "地区", "城市", "网络延迟", "下载速度"})
-	} else {
-		writer.Write([]string{"IP地址", "端口", "TLS", "数据中心", "地区", "城市", "网络延迟"})
-	}
-	for _, res := range results {
-		if *doSpeedTest > 0 {
-			writer.Write([]string{res.resultNoSpeed.ip, strconv.Itoa(res.resultNoSpeed.port), strconv.FormatBool(*forceTLS), res.resultNoSpeed.dataCenter, res.resultNoSpeed.region, res.resultNoSpeed.city, fmt.Sprintf("%d ms", res.resultNoSpeed.tcpRTT), fmt.Sprintf("%.0f kB/s", res.downSpeed)})
-		} else {
-			writer.Write([]string{res.resultNoSpeed.ip, strconv.Itoa(res.resultNoSpeed.port), strconv.FormatBool(*forceTLS), res.resultNoSpeed.dataCenter, res.resultNoSpeed.region, res.resultNoSpeed.city, fmt.Sprintf("%d ms", res.resultNoSpeed.tcpRTT)})
-		}
-	}
-
-	writer.Flush()
 	// 清除输出内容
 	clearConsole()
-	fmt.Printf("成功将结果写入文件 %s，耗时 %d秒\n", *outFile, time.Since(startTime)/time.Second)
+
+	// 输出结果到文件
+	outFileName := fmt.Sprintf("%s-%s.csv", *outFilePrefix, startTime.Format("20060102_150405"))
+	resultsToCSV(results, tcpDead, outFileName)
+
+	timef("读入的IP总数: %d, 响应的记录总数: %d\n", len(ips), len(results))
+	timef("测试总耗时 %d 秒，结果写入文件 %s\n", time.Since(startTime)/time.Second, outFileName)
 }
