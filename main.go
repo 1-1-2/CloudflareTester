@@ -369,8 +369,36 @@ func reportProgress(progressChan chan int, total int, doneChan chan struct{}) {
 	doneChan <- struct{}{}
 }
 
+func clearConsole() {
+	switch runtime.GOOS {
+	case "linux", "android", "darwin", "dragonfly", "freebsd", "netbsd", "openbsd", "illumos", "solaris":
+		fmt.Print("\033[2J\033[H")
+	case "windows":
+		cmd := exec.Command("cmd", "/c", "cls")
+		cmd.Stdout = os.Stdout
+		cmd.Run()
+	default:
+		// fmt.Println("清屏命令不适用于当前系统")
+	}
+}
+
+func terminalTitle(title string) {
+	switch runtime.GOOS {
+	case "linux", "darwin", "freebsd", "netbsd", "openbsd", "illumos", "solaris":
+		fmt.Printf("\033]0;%s\007", title)
+	case "windows":
+		cmd := exec.Command("cmd", "/c", "title", title)
+		cmd.Run()
+	default:
+		// fmt.Println("不支持的操作系统")
+	}
+}
+
 func main() {
 	flag.Parse()
+
+	// 设置控制台运行标题
+	terminalTitle(fmt.Sprintf("[CFtester]%s>>%s", *ipFile, *outFile))
 
 	osType := runtime.GOOS
 	if osType == "linux" {
@@ -550,6 +578,6 @@ func main() {
 
 	writer.Flush()
 	// 清除输出内容
-	fmt.Print("\033[2J")
+	clearConsole()
 	fmt.Printf("成功将结果写入文件 %s，耗时 %d秒\n", *outFile, time.Since(startTime)/time.Second)
 }
