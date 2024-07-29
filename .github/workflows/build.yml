@@ -1,0 +1,125 @@
+name: Build CFtester
+
+on:
+  push:
+    paths:
+      - '**.go'
+  workflow_dispatch:
+    inputs:
+      release:
+        type: boolean
+        description: '发布到release'
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+
+      - name: Build binaries
+        run: |
+          echo 'Build for MacOS 64-bit'
+          GOOS=darwin GOARCH=amd64 go build -o CFtester-darwin-amd64 ./main.go &
+
+          echo 'Build for MacOS ARM 64-bit'
+          GOOS=darwin GOARCH=arm64 go build -o CFtester-darwin-arm64 ./main.go &
+
+          echo 'Build for Linux 32-bit'
+          GOOS=linux GOARCH=386 go build -o CFtester-linux-386 ./main.go &
+
+          echo 'Build for Linux 64-bit'
+          GOOS=linux GOARCH=amd64 go build -o CFtester-linux-amd64 ./main.go &
+
+          echo 'Build for Linux ARM 64-bit'
+          GOOS=linux GOARCH=arm64 go build -o CFtester-linux-arm64 ./main.go &
+
+          echo 'Build for Linux ARM 32-bit (v5)'
+          GOOS=linux GOARCH=arm GOARM=5 go build -o CFtester-linux-arm5 ./main.go &
+
+          echo 'Build for Linux ARM 32-bit (v6)'
+          GOOS=linux GOARCH=arm GOARM=6 go build -o CFtester-linux-arm6 ./main.go &
+
+          echo 'Build for Linux ARM 32-bit (v7)'
+          GOOS=linux GOARCH=arm GOARM=7 go build -o CFtester-linux-arm7 ./main.go &
+
+          echo 'Build for Linux MIPS 32-bit'
+          GOOS=linux GOARCH=mips go build -o CFtester-linux-mips ./main.go &
+
+          echo 'Build for Linux MIPS 64-bit'
+          GOOS=linux GOARCH=mips64 go build -o CFtester-linux-mips64 ./main.go &
+
+          echo 'Build for Linux MIPS LE 32-bit'
+          GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -o CFtester-linux-mipsle ./main.go &
+
+          echo 'Build for Linux MIPS LE 64-bit'
+          GOOS=linux GOARCH=mips64le go build -o CFtester-linux-mips64le ./main.go &
+
+          echo 'Build for Windows 32-bit'
+          GOOS=windows GOARCH=386 go build -o CFtester-windows-386.exe ./main.go &
+
+          echo 'Build for Windows 64-bit'
+          GOOS=windows GOARCH=amd64 go build -o CFtester-windows-amd64.exe ./main.go &
+
+          echo 'Build for Windows ARM 64-bit'
+          GOOS=windows GOARCH=arm64 go build -o CFtester-windows-arm64.exe ./main.go &
+
+          wait
+          mkdir -p bin
+          mv CFtester-* bin/
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          install-only: true
+
+      - name: Compress binaries with UPX
+        run: |
+          cd bin
+          for FILE in *; do
+            if upx --best --lzma "$FILE"; then
+              if [[ "$FILE" == *.* ]]; then
+                tag_FILE="${FILE%.*}_upx.${FILE##*.}"
+              else
+                tag_FILE="${FILE}_upx"
+              fi
+              mv "$FILE" "$tag_FILE"
+            else
+              echo "::warning title=UPX compression::failed for $FILE, check if it's not supported"
+            fi
+          done
+
+          # macOS is currently not supported (or try --force-macos) 
+          # see https://github.com/upx/upx/issues/612
+
+      - name: Upload Artifacts - darwin
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-binaries
+          path: bin/*darwin*
+
+      - name: Upload Artifacts - linux
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: bin/*linux*
+
+      - name: Upload Artifacts - windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: bin/*windows*
+
+      - name: Create release
+        id: create_release
+        if: inputs.release
+        uses: actions/create-release@main
+        with:
+          files: |
+            bin/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
