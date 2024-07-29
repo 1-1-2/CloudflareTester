@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -22,9 +23,12 @@ import (
 )
 
 const (
-	tcpTimeout  = 1 * time.Second                      // TCP连接超时时间
-	httpTimeout = 2 * time.Second                      // HTTP请求超时时间
-	traceURL    = "speed.cloudflare.com/cdn-cgi/trace" // Cloudflare trace URL
+	tcpTimeout       = 1 * time.Second                      // TCP连接超时时间
+	httpTimeout      = 2 * time.Second                      // HTTP请求超时时间
+	downloadDuration = 5 * time.Second                      // 最长下载持续时间
+	traceURL         = "speed.cloudflare.com/cdn-cgi/trace" // Cloudflare trace URL
+	UA               = "Mozilla/5.0"                        // User-Agent
+	limitCIDR        = 1024                                 // 单条CIDR最大长度限制
 )
 
 var (
@@ -35,6 +39,9 @@ var (
 	doSpeedTest  = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")                                     // 下载测速协程数量
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
 	forceTLS     = flag.Bool("tls", false, "是否强制启用TLS")                                        // TLS是否启用
+	maxAttempt   = flag.Int("attempt", 5, "最大重试次数")                                            // 各项测试最大重试次数
+	ipCounts     = 0                                                                           // 存储读入的ip总数
+	startTime    = time.Now()
 )
 
 type resultNoSpeed struct {
@@ -60,7 +67,66 @@ type location struct {
 	City   string  `json:"city"`
 }
 
-// IPaddOne函数实现ip地址自增
+// 带时间前缀的printf
+func timef(format string, a ...interface{}) {
+	fmt.Printf(fmt.Sprintf("|%.2fs| %s", float64(time.Since(startTime).Milliseconds())/1000, format), a...)
+}
+
+func getJSON(url, filepath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("下载失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("无法读取响应体: %v", err)
+	}
+
+	err = os.WriteFile(filepath, body, 0644)
+	if err != nil {
+		return fmt.Errorf("无法写入文件: %v", err)
+	}
+	return nil
+}
+
+// loadLocations 从本地文件或远程URL加载位置信息
+// 如果本地文件不存在，会从远程URL下载
+// 返回一个map，key是IATA代码，value是location结构体
+func loadLocations() (map[string]location, error) {
+	const locationFile = "locations.json"
+	const locationURL = "https://speed.cloudflare.com/locations"
+
+	// 检查本地文件是否存在
+	if _, err := os.Stat(locationFile); os.IsNotExist(err) {
+		timef("本地未找到 locations.json, 正从 %s 下载...", locationURL)
+		if err := getJSON(locationURL, locationFile); err != nil {
+			return nil, err
+		}
+	} else {
+		timef("本地 locations.json 已存在, 无需重新下载\n")
+	}
+
+	// 读取和解析 JSON 文件
+	jsbody, err := os.ReadFile(locationFile)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取文件: %v", err)
+	}
+	var locations []location
+	if err := json.Unmarshal(jsbody, &locations); err != nil {
+		return nil, fmt.Errorf("JSON解析失败: %v", err)
+	}
+
+	// 构建 location 字典
+	locationMap := make(map[string]location)
+	for _, loc := range locations {
+		locationMap[loc.Iata] = loc
+	}
+	return locationMap, nil
+}
+
+// IPaddOne 将给定的IP地址递增1
 func IPaddOne(ip net.IP) {
 	for j := len(ip) - 1; j >= 0; j-- {
 		ip[j]++
@@ -70,32 +136,114 @@ func IPaddOne(ip net.IP) {
 	}
 }
 
-// 从文件中读取IP地址
-func readIPs(File string) ([]string, error) {
-	file, err := os.Open(File)
+// IPaddN 将给定的IP地址增加1
+func IPaddN(ip net.IP, n *big.Int) net.IP {
+	// 判断是否是IPv4并转换为IPv6表示法
+	if ip.To4() != nil {
+		ip = ip.To4()
+	} else {
+		ip = ip.To16()
+	}
+
+	ipInt := big.NewInt(0)
+	ipInt.SetBytes(ip)
+
+	ipInt.Add(ipInt, n)
+
+	ipBytes := ipInt.Bytes()
+	if len(ipBytes) > net.IPv6len {
+		ipBytes = ipBytes[len(ipBytes)-net.IPv6len:]
+	} else if len(ipBytes) < net.IPv6len {
+		ipBytes = append(make([]byte, net.IPv6len-len(ipBytes)), ipBytes...)
+	}
+
+	return net.IP(ipBytes)
+}
+
+// hasIPv6 检查设备是否有可用的IPv6外部网络连接
+func hasIPv6() bool {
+	publicDNS := "2400:3200::1" // 公共DNS的IPv6地址
+
+	for i := 1; i <= *maxAttempt; i++ {
+		timef("通过 DOH 可达性检测 IPv6 连接，第 %d 次尝试...\n", i)
+		conn, err := net.DialTimeout("tcp6", net.JoinHostPort(publicDNS, "80"), httpTimeout)
+		if err != nil {
+			timef("失败 : %v\n", err)
+		} else {
+			conn.Close()
+			timef("IPv6 可达(%s)\n", publicDNS)
+			return true
+		}
+		time.Sleep(1 * time.Second) // 在下一次尝试前等待
+	}
+	timef("多次尝试后未能连接到IPv6地址\n")
+	return false
+}
+
+func readIPs(filepath string) ([]string, error) {
+	var ips []string
+	file, err := os.Open(filepath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("无法打开文件: %v", err)
 	}
 	defer file.Close()
-	var ips []string
+
+	v6able := hasIPv6()
+	if v6able {
+		timef("本机已启用IPv6网络\n")
+	} else {
+		timef("本机未启用IPv6网络\n")
+	}
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		ipAddr := scanner.Text()
-		// 判断是否为 CIDR 格式的 IP 地址
-		if strings.Contains(ipAddr, "/") {
-			ip, ipNet, err := net.ParseCIDR(ipAddr)
-			if err != nil {
-				fmt.Printf("无法解析CIDR格式的IP: %v\n", err)
-				continue
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, ":") && !v6able {
+			timef("提示: 本机未启用IPv6网络, %s 将被跳过\n", line)
+			continue
+		}
+
+		ip, network, err := net.ParseCIDR(line)
+		if err == nil {
+			// 处理CIDR地址块
+			// 计算CIDR范围内的IP地址数量
+			ones, bits := network.Mask.Size()
+			ipCount := new(big.Int).Lsh(big.NewInt(1), uint(bits-ones))
+			if ipCount.Cmp(big.NewInt(limitCIDR)) > 0 {
+				timef("提示: %s 包含 %s 个IP地址，等距抽样 %d 个参与测试\n", line, ipCount.String(), limitCIDR)
+				sampled := make([]string, limitCIDR)
+				gap := new(big.Int).Div(ipCount, big.NewInt(limitCIDR))
+				for i := 0; i < limitCIDR; i++ {
+					perm := new(big.Int).Mul(gap, big.NewInt(int64(i)))
+					sampledIP := IPaddN(ip, perm)
+					sampled[i] = sampledIP.String()
+				}
+				ips = append(ips, sampled...)
+			} else {
+				timef("%s 包含 %s 个IP地址\n", line, ipCount.String())
+				cidr_ips := make([]string, 0)
+				for ip := ip.Mask(network.Mask); network.Contains(ip); IPaddOne(ip) {
+					cidr_ips = append(cidr_ips, ip.String())
+				}
+				ips = append(ips, cidr_ips...)
 			}
-			for ip := ip.Mask(ipNet.Mask); ipNet.Contains(ip); IPaddOne(ip) {
-				ips = append(ips, ip.String())
-			}
+		} else if ip = net.ParseIP(line); ip != nil {
+			// 单个IP
+			ips = append(ips, ip.String())
 		} else {
-			ips = append(ips, ipAddr)
+			timef("无法解析的IP或CIDR: %s\n", line)
 		}
 	}
-	return ips, scanner.Err()
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取文件时发生错误: %v", err)
+	}
+
+	ipCounts = len(ips)
+	return ips, nil
 }
 
 // 测速函数
@@ -109,11 +257,11 @@ func speedOnce(ip string) float64 {
 	speedTestURL := protocol + *speedTestURL
 	// 创建请求
 	req, _ := http.NewRequest("GET", speedTestURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", UA)
 
 	// 创建TCP连接
 	dialer := &net.Dialer{
-		Timeout:   tcpTimeout,
+		Timeout:   downloadDuration,
 		KeepAlive: 0,
 	}
 	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
@@ -156,7 +304,6 @@ func speedOnce(ip string) float64 {
 func main() {
 	flag.Parse()
 
-	startTime := time.Now()
 	osType := runtime.GOOS
 	if osType == "linux" {
 		// 尝试提升文件描述符的上限
@@ -170,72 +317,15 @@ func main() {
 		}
 	}
 
-	var locations []location
-	if _, err := os.Stat("locations.json"); os.IsNotExist(err) {
-		fmt.Println("本地 locations.json 不存在\n正在从 https://speed.cloudflare.com/locations 下载 locations.json")
-		resp, err := http.Get("https://speed.cloudflare.com/locations")
-		if err != nil {
-			fmt.Printf("无法从URL中获取JSON: %v\n", err)
-			return
-		}
-
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Printf("无法读取响应体: %v\n", err)
-			return
-		}
-
-		err = json.Unmarshal(body, &locations)
-		if err != nil {
-			fmt.Printf("无法解析JSON: %v\n", err)
-			return
-		}
-		file, err := os.Create("locations.json")
-		if err != nil {
-			fmt.Printf("无法创建文件: %v\n", err)
-			return
-		}
-		defer file.Close()
-
-		_, err = file.Write(body)
-		if err != nil {
-			fmt.Printf("无法写入文件: %v\n", err)
-			return
-		}
-	} else {
-		fmt.Println("本地 locations.json 已存在,无需重新下载")
-		file, err := os.Open("locations.json")
-		if err != nil {
-			fmt.Printf("无法打开文件: %v\n", err)
-			return
-		}
-		defer file.Close()
-
-		body, err := io.ReadAll(file)
-		if err != nil {
-			fmt.Printf("无法读取文件: %v\n", err)
-			return
-		}
-
-		err = json.Unmarshal(body, &locations)
-		if err != nil {
-			fmt.Printf("无法解析JSON: %v\n", err)
-			return
-		}
-	}
-
-	locationMap := make(map[string]location)
-	for _, loc := range locations {
-		locationMap[loc.Iata] = loc
-	}
-
+	// 从文件中读取 IP 地址
 	ips, err := readIPs(*ipFile)
 	if err != nil {
-		fmt.Printf("无法从文件中读取 IP: %v\n", err)
+		timef("读取文件时发生错误: %v\n", err)
 		return
 	}
+
+	// 加载地址库
+	locationMap, err := loadLocations()
 
 	var wg sync.WaitGroup
 	wg.Add(len(ips))
@@ -295,7 +385,7 @@ func main() {
 			req, _ := http.NewRequest("GET", requestURL, nil)
 
 			// 添加用户代理
-			req.Header.Set("User-Agent", "Mozilla/5.0")
+			req.Header.Set("User-Agent", UA)
 			req.Close = true
 			resp, err := client.Do(req)
 			if err != nil {
