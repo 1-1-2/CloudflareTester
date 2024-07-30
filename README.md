@@ -1,47 +1,65 @@
 # 简介
-Cloudflare IP 测速器是一个使用 Golang 编写的小工具，用于测试一些 Cloudflare 的 IP 地址的延迟和下载速度，并将结果输出到 CSV 文件中。
+Cloudflare Tester 是一个使用 Golang 编写的小工具，用于测试 Cloudflare IP 地址的延迟、回源时间和下载速度，并将结果输出到 CSV 文件中。
 
-# 安装
+# Action 编译
+详见本库 Github Actions。
+
+# 手动编译
 首先安装 Golang 和 Git，然后在终端中运行以下命令：
 
+```sh
+git clone https://github.com/1-1-2/CloudflareTester.git
+cd CloudflareTester
+go build -o CFtester main.go
 ```
-git clone https://github.com/badafans/Cloudflare-IP-SpeedTest.git
-cd Cloudflare-IP-SpeedTest
-go build -o ipspeedtest main.go
-```
-这将编译可执行文件 ipspeedtest。
+
+这将编译可执行文件 `CFtester`。
 
 # 参数说明
-ipspeedtest 可以接受以下参数：
+`CFtester` 接受以下参数：
 
-- file: IP地址文件名称 (default "ip.txt")
-- max: 并发请求最大协程数 (default 100)
-- outfile: 输出文件名称 (default "ip.csv")
-- port:	端口 (default 443)
-- speedtest: 下载测速协程数量,设为0禁用测速 (default 5)
-- tls: 是否启用TLS (default true)
-- url: 测速文件地址 (default "speed.cloudflare.com/__down?bytes=500000000")
+- `ipin`: IP 地址文件名称 (默认值: "ip.txt")
+- `xout`: 输出文件前缀 (默认值: "result")
+- `tcport`: tcp测试端口 (默认值: 443)
+- `th`: 并发请求最大协程数 (默认值: 100)
+- `spdt`: 下载测速协程数量, 设为 0 禁用测速 (默认值: 0)
+- `tls`: 全局使用 TLS (默认值: false)
+- `url`: 测速文件地址 (默认值: "https://speed.cloudflare.com/__down?bytes=500000000")
+- `origin`: 回源测试地址 (默认值: ""，留空则禁用)
 
 # 运行
-在终端中运行以下命令来启动程序：
+在终端运行命令示例：
 
+```sh
+# 启用回源和测速
+./CFtester -ipin=myip.txt -xout=myrst -th=50 -spdt=5 -origin=www.cloudflare.com
+
+# 指定输入和输出的前缀
+./CFtester -ipin=myip.txt -xout=myrst
+
+# 启用全局tls，减少线程数
+./CFtester -tls=true -th=50
 ```
-./ipspeedtest -file=ip.txt -outfile=ip.csv -port=443 -max=100 -speedtest=1 -tls=true -url=speed.cloudflare.com/__down?bytes=500000000
-```
-请替换参数值以符合您的实际需求。
 
-# 输出说明
-程序将输出每个成功测试的 IP 地址的信息，包括 IP 地址、端口、数据中心、地区、城市、网络延迟和下载速度（如果选择测速）。
+# 输出
+输出的 CSV 文件包含以下列：
 
-程序还会将所有结果写入一个 CSV 文件中。
+- IP地址
+- TCP端口
+- TLS
+- 数据中心
+- 地区（如出错，则为空）
+- 城市（如出错，则为空）
+- TCP Reach (TCP 请求成功率)
+- TCP RTT min (最小延迟)
+- TCP RTT avg (平均延迟)
+- TCP RTT max (最大延迟)
+- HTTP RTT（如出错，则为0）
+- 回源 RTT（如出错，则为0）
+- 下载速度 (如果启用测速)
 
-# 许可证
-The MIT License (MIT)
-
-此处，"软件" 指 Cloudflare IP 测速器。
-
-特此授予非限制性许可证，允许任何人获得本软件副本并自由使用、复制、修改、合并、出版发行、散布、再许可和/或销售本软件的副本，以及将本软件与其它软件捆绑在一起使用。
-
-上述版权声明和本许可声明应包含在本软件的所有副本或主要部分中。
-
-本软件按 "原样" 提供，没有任何形式的明示或暗示保证，包括但不限于适销性保证、特定用途适用性保证和非侵权保证。在任何情况下，作者或版权所有者均不对任何索赔、损害或其他责任负责，无论是在合同、侵权或其他方面，由于或与软件或使用或其他交易中的软件产生或与之相关的操作。
+# 提示
+- 程序会自动从 `https://speed.cloudflare.com/locations` 下载位置信息，并将其存储在 `locations.json` 文件中。如果该文件已存在，则会直接使用本地文件。
+- 对于地址数大于 2^10 个的 IPv6 网络，程序会随机抽样 1024 个 IP 进行测试。（逻辑是这样的，未测试）
+- 如果没有启用全局 TLS，对未指定协议的地址会默认使用 HTTP ，并在 HTTP 和回源测试中使用 80 端口。
+- 如果操作系统是 Linux，程序会尝试提升文件描述符的上限以支持更多的并发请求。
