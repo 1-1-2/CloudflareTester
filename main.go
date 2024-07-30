@@ -195,7 +195,7 @@ func hasIPv6() bool {
 }
 
 func readIPs(filepath string) ([]string, error) {
-	var ips []string
+	ips := []string{}
 	file, err := os.Open(filepath)
 	if err != nil {
 		return nil, fmt.Errorf("无法打开文件: %v", err)
@@ -288,14 +288,14 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 
 	timef("开始执行 TCP连通性 测试, 共 %d 个目标\n", len(ips))
 
-	// 初始化用于统计的 map
+	// 初始化用于统计响应信息的 map
 	tcpStats := make(map[string]*resultTCP)
 	var mu sync.Mutex // 保护 tcpStats 的互斥锁
 
 	for attempts := 0; attempts < *maxAttempt; attempts++ {
 		for _, ip := range ips {
-			thread <- struct{}{}
 			wg.Add(1)
+			thread <- struct{}{}
 			go func(ip string, attempts int) {
 				defer func() {
 					<-thread
@@ -336,16 +336,26 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 	timef("TCP 测试已结束，正在统计数据...\n")
 	resultAlive := []resultTCP{}
 	resultDead := []string{}
-	for _, stats := range tcpStats {
-		if stats.tcpReach > 0 {
-			stats.tcpRTTavg = stats.tcpRTTsum / time.Duration(stats.tcpReach)
-			stats.reachRatio = float64(stats.tcpReach) / float64(*maxAttempt) * 100
-			resultAlive = append(resultAlive, *stats)
+	for _, ip := range ips {
+		if _, exists := tcpStats[ip]; exists {
+			// 有响应结果
+			stats := tcpStats[ip]
+			if stats.tcpReach > 0 {
+				stats.tcpRTTavg = stats.tcpRTTsum / time.Duration(stats.tcpReach)
+				stats.reachRatio = float64(stats.tcpReach) / float64(*maxAttempt) * 100
+				resultAlive = append(resultAlive, *stats)
+			} else {
+				// 被记录的异常响应
+				timef("哪里出了错，%s 没有测试结果？\n", ip)
+				resultDead = append(resultDead, ip)
+			}
 		} else {
-			resultDead = append(resultDead, stats.ip)
+			// 没有响应结果
+			resultDead = append(resultDead, ip)
 		}
 	}
 
+	timef("TCP 测试流程结束...\n")
 	return resultAlive, resultDead
 }
 
@@ -464,8 +474,8 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 
 	timef("开始执行 HTTP和回源 测试\n")
 	for _, res := range tcpResults {
-		thread <- struct{}{}
 		wg.Add(1)
+		thread <- struct{}{}
 		go func(res resultTCP) {
 			defer func() {
 				<-thread
@@ -476,7 +486,6 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 			httpRTT, body, err := httpTraceOnce(res.ip)
 			if err != nil {
 				fmt.Printf("HTTP测试失败: %v\n", err)
-				return
 			}
 
 			// 回源测试
@@ -485,7 +494,6 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 				originRTT, err = httpOriginOnce(res.ip)
 				if err != nil {
 					fmt.Printf("回源测试失败: %v\n", err)
-					return
 				}
 			}
 
@@ -520,12 +528,10 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 	}
 
 	timef("正在等待 HTTP 测试结束...\n")
-	go func() {
-		wg.Wait()
-		close(resultHTTPChan)
-		timef("HTTP 测试已结束...\n")
-	}()
+	wg.Wait()
+	close(resultHTTPChan)
 
+	timef("HTTP 测试已结束...\n")
 	return resultHTTPChan
 }
 
@@ -589,19 +595,15 @@ func speedTests(resultChan chan resultNoSpeed) []resultAddSpeed {
 		}(res)
 	}
 
-	// 等待所有任务完成
 	timef("正在等待 测速 结束...\n")
-	go func() {
-		wg.Wait()
-		close(speedResultsChan)
-		close(progressChan)
-	}()
-
+	wg.Wait()
+	close(speedResultsChan)
+	close(progressChan)
 	// 等待 reportProgress 函数完成
 	<-doneChan
 
 	timef("测速已结束，正在统计数据...\n")
-	var results []resultAddSpeed
+	results := []resultAddSpeed{}
 	for speedResult := range speedResultsChan {
 		results = append(results, speedResult)
 	}
@@ -699,7 +701,7 @@ func main() {
 	flag.Parse()
 
 	// 设置控制台运行标题
-	terminalTitle(fmt.Sprintf("[CFtester]%s>>%s", *ipFile, *outFilePrefix))
+	terminalTitle(fmt.Sprintf("[CFtester]%s To %s", *ipFile, *outFilePrefix))
 
 	// 如果操作系统是 linux 增加最大打开文件数
 	osType := runtime.GOOS
@@ -738,7 +740,7 @@ func main() {
 	// }
 	// 上面这个写法是错的，len(resultChan)返回的是通道的容量
 
-	var results []resultAddSpeed
+	results := []resultAddSpeed{}
 	if *doSpeedTest > 0 {
 		results := speedTests(resultChan)
 		// 根据下载速度排序
