@@ -361,13 +361,22 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 
 // genURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
 func genURL(oriURL string) (string, int) {
-	if strings.HasPrefix(oriURL, "https://") || *forceTLS {
-		return "https://" + strings.TrimPrefix(oriURL, "https://"), 443
+	if strings.HasPrefix(oriURL, "https://") {
+		return oriURL, 443
 	}
 	if strings.HasPrefix(oriURL, "http://") {
-		return oriURL, 80
+		if *forceTLS {
+			return "https" + strings.TrimPrefix(oriURL, "http"), 443
+		} else {
+			return oriURL, 80
+		}
 	}
-	return "http://" + oriURL, 80
+	// 未指定协议的
+	if *forceTLS {
+		return "https://" + oriURL, 443
+	} else {
+		return "http://" + oriURL, 80
+	}
 }
 
 // 公共函数，用于创建 HTTP 客户端和请求
@@ -433,7 +442,7 @@ func httpTraceOnce(ip string) (time.Duration, *bytes.Buffer, error) {
 
 		return duration, buf, nil
 	}
-	return 0, nil, fmt.Errorf("[%s] trace请求全部超时", ip)
+	return 0, nil, fmt.Errorf("trace请求全部超时")
 }
 
 // httpOriginOnce 执行回源时间测试并返回持续时间
@@ -461,7 +470,7 @@ func httpOriginOnce(ip string) (time.Duration, error) {
 		duration := time.Since(startTime)
 		return duration, nil
 	}
-	return 0, fmt.Errorf("[%s] 回源请求全部超时", ip)
+	return 0, fmt.Errorf("回源请求全部超时")
 }
 
 // HTTP 和回源测试部分
@@ -485,7 +494,7 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 			// HTTP 测试
 			httpRTT, body, err := httpTraceOnce(res.ip)
 			if err != nil {
-				fmt.Printf("HTTP测试失败: %v\n", err)
+				fmt.Printf("[%s] HTTP测试失败: %v\n", res.ip, err)
 			}
 
 			// 回源测试
@@ -493,7 +502,7 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 			if *originTestURL != "" {
 				originRTT, err = httpOriginOnce(res.ip)
 				if err != nil {
-					fmt.Printf("回源测试失败: %v\n", err)
+					fmt.Printf("[%s] 回源测试失败: %v\n", res.ip, err)
 				}
 			}
 
@@ -536,29 +545,33 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 }
 
 // 重构后的 speedOnce 函数
-func speedOnce(ip string) float64 {
+func speedOnce(ip string) (float64, error) {
 	URL, port := genURL(*speedTestURL)
-	client, req, err := genClient(ip, port, URL)
-	if err != nil {
-		return 0
+	speedAttempts := 3
+	for attempts := 0; attempts < speedAttempts; attempts++ {
+		startTime := time.Now()
+		client, req, err := genClient(ip, port, URL)
+		if err != nil {
+			return 0, err
+		}
+		// 修改 client 的超时时间为 downloadDuration
+		client.Timeout = downloadDuration
+
+		timef("启动 [%s:%d] 测速(第%d次)\n", ip, port, attempts+1)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			timef("[%s:%d] 测速(第%d次)出错%v\n", ip, port, attempts+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		written, _ := io.Copy(io.Discard, resp.Body)
+		duration := time.Since(startTime)
+		speed := float64(written) / duration.Seconds() / 1024
+		return speed, nil
 	}
-	// 修改 client 的超时时间为 downloadDuration
-	client.Timeout = downloadDuration
-
-	timef("正在使用 %s:%d 进行测速\n", ip, port)
-	startTime := time.Now()
-
-	resp, err := client.Do(req)
-	if err != nil {
-		timef("%s:%d 测速失败\n", ip, port)
-		return 0
-	}
-	defer resp.Body.Close()
-
-	written, _ := io.Copy(io.Discard, resp.Body)
-	duration := time.Since(startTime)
-	speed := float64(written) / duration.Seconds() / 1024
-	return speed
+	return 0, fmt.Errorf("%d次重试均未成功", speedAttempts)
 }
 
 // speedTests 对已经通过延迟测试的IP进行下载速度测试
@@ -566,17 +579,16 @@ func speedOnce(ip string) float64 {
 // 过程中，调用reportProgress报告测试进度
 func speedTests(resultChan chan resultNoSpeed) []resultAddSpeed {
 	var wg sync.WaitGroup
-	thread := make(chan struct{}, *maxThreads)
+	thread := make(chan struct{}, *doSpeedTest)
 
 	// 创建 speedResultsChan 通道，用于存储 speedtestresult 结构体
 	speedResultsChan := make(chan resultAddSpeed, len(resultChan))
-
 	// 创建 progressChan 和 doneChan 通道，启动 reportProgress 函数，用于报告进度
 	progressChan := make(chan int, 1)
 	doneChan := make(chan struct{})
 	go reportProgress(progressChan, len(resultChan), doneChan)
 
-	// 遍历 resultChan 通道，对每个结果进行处理
+	timef("开始执行 测速 测试\n")
 	for res := range resultChan {
 		wg.Add(1)
 		thread <- struct{}{}
@@ -586,9 +598,14 @@ func speedTests(resultChan chan resultNoSpeed) []resultAddSpeed {
 				wg.Done()
 			}()
 
-			// 测速，结果发送到 speedResultsChan 通道
-			downloadSpeed := speedOnce(res.ip)
-			speedResultsChan <- resultAddSpeed{resultNoSpeed: res, downSpeed: downloadSpeed}
+			speed, err := speedOnce(res.ip)
+			if err != nil {
+				fmt.Printf("[%s] 测速失败: %v\n", res.ip, err)
+				speedResultsChan <- resultAddSpeed{resultNoSpeed: res}
+			} else {
+				fmt.Printf("[%s] 测速结果: %.2f KB/s\n", res.ip, speed)
+				speedResultsChan <- resultAddSpeed{resultNoSpeed: res, downSpeed: speed}
+			}
 
 			// 进度+1
 			progressChan <- 1
@@ -616,9 +633,8 @@ func reportProgress(progressChan chan int, total int, doneChan chan struct{}) {
 	for count := range progressChan {
 		currentCount += count
 		percentage := float64(currentCount) / float64(total) * 100
-		timef("已完成: %.2f%%\r", percentage)
+		timef("%d / %d 已完成（%.2f%%）\r", currentCount, total, percentage)
 		if currentCount == total {
-			timef("已完成: %.2f%%\n", percentage)
 			break
 		}
 	}
@@ -648,18 +664,18 @@ func resultsToCSV(results []resultAddSpeed, tcpDead []string, outFileName string
 	for _, res := range results {
 		// 有响应的记录
 		record := []string{
-			res.resultNoSpeed.ip,
-			strconv.Itoa(res.resultNoSpeed.port),
+			res.ip,
+			strconv.Itoa(res.port),
 			strconv.FormatBool(*forceTLS),
-			res.resultNoSpeed.dataCenter,
-			res.resultNoSpeed.region,
-			res.resultNoSpeed.city,
-			fmt.Sprintf("%.2f%%", res.resultNoSpeed.reachRatio),
-			fmt.Sprintf("%d", res.resultNoSpeed.tcpRTTmin.Milliseconds()),
-			fmt.Sprintf("%d", res.resultNoSpeed.tcpRTTavg.Milliseconds()),
-			fmt.Sprintf("%d", res.resultNoSpeed.tcpRTTmax.Milliseconds()),
-			fmt.Sprintf("%d", res.resultNoSpeed.httpRTT.Milliseconds()),
-			fmt.Sprintf("%d", res.resultNoSpeed.originRTT.Milliseconds()),
+			res.dataCenter,
+			res.region,
+			res.city,
+			fmt.Sprintf("%.2f%%", res.reachRatio),
+			fmt.Sprintf("%d", res.tcpRTTmin.Milliseconds()),
+			fmt.Sprintf("%d", res.tcpRTTavg.Milliseconds()),
+			fmt.Sprintf("%d", res.tcpRTTmax.Milliseconds()),
+			fmt.Sprintf("%d", res.httpRTT.Milliseconds()),
+			fmt.Sprintf("%d", res.originRTT.Milliseconds()),
 		}
 		if *doSpeedTest > 0 {
 			record = append(record, fmt.Sprintf("%.0f kB/s", res.downSpeed))
@@ -742,7 +758,7 @@ func main() {
 
 	results := []resultAddSpeed{}
 	if *doSpeedTest > 0 {
-		results := speedTests(resultChan)
+		results = speedTests(resultChan)
 		// 根据下载速度排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].downSpeed > results[j].downSpeed
@@ -753,7 +769,7 @@ func main() {
 		}
 		// 根据TCP平均RTT排序
 		sort.Slice(results, func(i, j int) bool {
-			return results[i].resultNoSpeed.tcpRTTavg < results[j].resultNoSpeed.tcpRTTavg
+			return results[i].tcpRTTavg < results[j].tcpRTTavg
 		})
 	}
 
