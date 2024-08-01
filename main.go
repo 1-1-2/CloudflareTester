@@ -101,6 +101,10 @@ func getJSON(url, filepath string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("非预期的状态码: %d", resp.StatusCode)
+	}
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("无法读取响应体: %v", err)
@@ -364,7 +368,7 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 		}
 	}
 
-	timef("TCP 测试流程结束，与 %d 中的 %d 个握手成功\n", ipCounts, len(resultAlive))
+	timef("TCP 测试流程结束，与 %d 个IP中的 %d 个握手成功\n", ipCounts, len(resultAlive))
 	return resultAlive, ipDead
 }
 
@@ -685,7 +689,7 @@ func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 			fmt.Sprintf("%d", res.originRTT.Milliseconds()),
 		}
 		if *doSpeedTest > 0 {
-			record = append(record, fmt.Sprintf("%.0f kB/s", res.downSpeed))
+			record = append(record, fmt.Sprintf("%.0f", res.downSpeed))
 		}
 		writer.Write(record)
 	}
@@ -720,23 +724,41 @@ func terminalTitle(title string) {
 	}
 }
 
+// 检查并尝试提升文件描述符上限
+func ulimitLinux() {
+	timef("尝试提升文件描述符的上限...\n")
+
+	// 检查当前文件描述符的限制
+	output, err := exec.Command("sh", "-c", "ulimit -n").Output()
+	if err != nil {
+		timef("获取当前文件描述符上限时出现错误: %v\n", err)
+	} else {
+		currentLimit, err := strconv.Atoi(strings.TrimSpace(string(output)))
+		if err != nil {
+			timef("解析当前文件描述符上限时出现错误: %v\n", err)
+		} else if currentLimit >= 10000 {
+			timef("当前文件描述符上限为 %d，无需提升\n", currentLimit)
+		} else {
+			// 尝试提升文件描述符上限
+			cmd := exec.Command("sh", "-c", "ulimit -n 10000")
+			if err := cmd.Run(); err != nil {
+				timef("提升文件描述符上限时出现错误: %v\n", err)
+			} else {
+				timef("文件描述符上限已成功提升到 10000\n")
+			}
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 
 	// 设置控制台运行标题
 	terminalTitle(fmt.Sprintf("[CFtester]%s To %s", *ipFile, *outFilePrefix))
 
-	// 如果操作系统是 linux 增加最大打开文件数
-	osType := runtime.GOOS
-	if osType == "linux" {
-		timef("正在尝试提升文件描述符的上限...\n")
-		cmd := exec.Command("bash", "-c", "ulimit -n 10000")
-		_, err := cmd.CombinedOutput()
-		if err != nil {
-			timef("提升文件描述符上限时出现错误: %v\n", err)
-		} else {
-			timef("文件描述符上限已提升!\n")
-		}
+	// 如果操作系统是 linux 尝试提升文件描述符上限
+	if runtime.GOOS == "linux" {
+		ulimitLinux()
 	}
 
 	// 加载地址库
