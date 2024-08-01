@@ -45,6 +45,7 @@ var (
 	maxAttempt    = flag.Int("attempt", 5, "最大重试次数")                                                    // 各项测试最大重试次数
 	ipCounts      = 0                                                                                   // 存储读入的ip总数
 	startTime     = time.Now()                                                                          // 记录程序开始运行的时间
+	locationMap   = make(map[string]location)                                                           // 存储位置信息
 )
 
 type resultTCP struct {
@@ -58,8 +59,8 @@ type resultTCP struct {
 	tcpRTTmax  time.Duration // TCP请求最大延迟
 }
 
-type resultNoSpeed struct {
-	resultTCP
+type resultHTTP struct {
+	ip         string        // IP地址
 	dataCenter string        // 数据中心
 	region     string        // 地区
 	city       string        // 城市
@@ -67,9 +68,16 @@ type resultNoSpeed struct {
 	originRTT  time.Duration // 回源测试延迟
 }
 
-type resultAddSpeed struct {
-	resultNoSpeed
+type resultSpeed struct {
+	ip        string  // IP地址
 	downSpeed float64 // 下载速度
+}
+
+// 结果聚合
+type resultMerge struct {
+	resultTCP
+	resultHTTP
+	resultSpeed
 }
 
 type location struct {
@@ -108,7 +116,7 @@ func getJSON(url, filepath string) error {
 // loadLocations 从本地文件或远程URL加载位置信息
 // 如果本地文件不存在，会从远程URL下载
 // 返回一个map，key是IATA代码，value是location结构体
-func loadLocations() (map[string]location, error) {
+func loadLocations() {
 	const locationFile = "locations.json"
 	const locationURL = "https://speed.cloudflare.com/locations"
 
@@ -116,7 +124,6 @@ func loadLocations() (map[string]location, error) {
 	if _, err := os.Stat(locationFile); os.IsNotExist(err) {
 		timef("本地未找到 locations.json, 正从 %s 下载...", locationURL)
 		if err := getJSON(locationURL, locationFile); err != nil {
-			return nil, err
 		}
 	} else {
 		timef("本地 locations.json 已存在, 无需重新下载\n")
@@ -125,19 +132,17 @@ func loadLocations() (map[string]location, error) {
 	// 读取和解析 JSON 文件
 	jsbody, err := os.ReadFile(locationFile)
 	if err != nil {
-		return nil, fmt.Errorf("无法读取文件: %v", err)
+		fmt.Printf("无法读取文件: %v", err)
 	}
 	var locations []location
 	if err := json.Unmarshal(jsbody, &locations); err != nil {
-		return nil, fmt.Errorf("JSON解析失败: %v", err)
+		fmt.Printf("JSON解析失败: %v", err)
 	}
 
 	// 构建 location 字典
-	locationMap := make(map[string]location)
 	for _, loc := range locations {
 		locationMap[loc.Iata] = loc
 	}
-	return locationMap, nil
 }
 
 // IPaddOne 将给定的IP地址递增1
@@ -335,7 +340,7 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 
 	timef("TCP 测试已结束，正在统计数据...\n")
 	resultAlive := []resultTCP{}
-	resultDead := []string{}
+	ipDead := []string{}
 	for _, ip := range ips {
 		if _, exists := tcpStats[ip]; exists {
 			// 有响应结果
@@ -344,19 +349,23 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 				stats.tcpRTTavg = stats.tcpRTTsum / time.Duration(stats.tcpReach)
 				stats.reachRatio = float64(stats.tcpReach) / float64(*maxAttempt) * 100
 				resultAlive = append(resultAlive, *stats)
+
+				// fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms\n",
+				// 	stats.ip, stats.reachRatio, stats.tcpRTTmin.Milliseconds(),
+				// 	stats.tcpRTTavg.Milliseconds(), stats.tcpRTTmax.Milliseconds())
 			} else {
 				// 被记录的异常响应
 				timef("哪里出了错，%s 没有测试结果？\n", ip)
-				resultDead = append(resultDead, ip)
+				ipDead = append(ipDead, ip)
 			}
 		} else {
 			// 没有响应结果
-			resultDead = append(resultDead, ip)
+			ipDead = append(ipDead, ip)
 		}
 	}
 
-	timef("TCP 测试流程结束...\n")
-	return resultAlive, resultDead
+	timef("TCP 测试流程结束，与 %d 中的 %d 个握手成功\n", ipCounts, len(resultAlive))
+	return resultAlive, ipDead
 }
 
 // genURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
@@ -474,35 +483,35 @@ func httpOriginOnce(ip string) (time.Duration, error) {
 }
 
 // HTTP 和回源测试部分
-func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan resultNoSpeed {
+func httpTests(ips []string) []resultHTTP {
 	var wg sync.WaitGroup
 	thread := make(chan struct{}, *maxThreads)
-	resultHTTPChan := make(chan resultNoSpeed, len(tcpResults))
+	resultHTTPChan := make(chan resultHTTP, len(ips))
 
 	re := regexp.MustCompile(`colo=([A-Z]+)`)
 
 	timef("开始执行 HTTP和回源 测试\n")
-	for _, res := range tcpResults {
+	for _, ip := range ips {
 		wg.Add(1)
 		thread <- struct{}{}
-		go func(res resultTCP) {
+		go func(ip string) {
 			defer func() {
 				<-thread
 				wg.Done()
 			}()
 
 			// HTTP 测试
-			httpRTT, body, err := httpTraceOnce(res.ip)
+			httpRTT, body, err := httpTraceOnce(ip)
 			if err != nil {
-				fmt.Printf("[%s] HTTP测试失败: %v\n", res.ip, err)
+				fmt.Printf("[%s] HTTP测试失败: %v\n", ip, err)
 			}
 
 			// 回源测试
 			originRTT := time.Duration(0)
 			if *originTestURL != "" {
-				originRTT, err = httpOriginOnce(res.ip)
+				originRTT, err = httpOriginOnce(ip)
 				if err != nil {
-					fmt.Printf("[%s] 回源测试失败: %v\n", res.ip, err)
+					fmt.Printf("[%s] 回源测试失败: %v\n", ip, err)
 				}
 			}
 
@@ -519,29 +528,35 @@ func httpTests(tcpResults []resultTCP, locationMap map[string]location) chan res
 				}
 			}
 
-			fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms, HTTP-RTT %d ms，回源RTT %d ms，数据中心: %s, 地区: %s, 城市: %s\n",
-				res.ip, res.reachRatio, res.tcpRTTmin.Milliseconds(), res.tcpRTTavg.Milliseconds(),
-				res.tcpRTTmax.Milliseconds(), httpRTT.Milliseconds(), originRTT.Milliseconds(), dataCenter, region, city)
-
-			result := resultNoSpeed{
-				resultTCP:  res,
+			result := resultHTTP{
+				ip:         ip,
 				dataCenter: dataCenter,
 				region:     region,
 				city:       city,
 				httpRTT:    httpRTT,
 				originRTT:  originRTT,
 			}
-
 			resultHTTPChan <- result
-		}(res)
+
+			fmt.Printf("[%s] HTTP-RTT %d ms，回源RTT %d ms，数据中心: %s, 地区: %s, 城市: %s\n",
+				ip, httpRTT.Milliseconds(), originRTT.Milliseconds(), dataCenter, region, city)
+		}(ip)
 	}
 
-	timef("正在等待 HTTP 测试结束...\n")
-	wg.Wait()
-	close(resultHTTPChan)
+	go func() {
+		timef("正在等待 HTTP 测试结束...\n")
+		wg.Wait()
+		close(resultHTTPChan)
+		timef("HTTP 测试已结束，正在等待数据整理...\n")
+	}()
 
-	timef("HTTP 测试已结束...\n")
-	return resultHTTPChan
+	// resultHTTPChan 转切片
+	var resultHTTPSlice []resultHTTP
+	for res := range resultHTTPChan {
+		resultHTTPSlice = append(resultHTTPSlice, res)
+	}
+
+	return resultHTTPSlice
 }
 
 // 重构后的 speedOnce 函数
@@ -577,50 +592,55 @@ func speedOnce(ip string) (float64, error) {
 // speedTests 对已经通过延迟测试的IP进行下载速度测试
 // 它使用goroutine并发进行测速，并通过channel返回结果
 // 过程中，调用reportProgress报告测试进度
-func speedTests(resultChan chan resultNoSpeed) []resultAddSpeed {
+func speedTests(ips []string) []resultSpeed {
 	var wg sync.WaitGroup
 	thread := make(chan struct{}, *doSpeedTest)
 
 	// 创建 speedResultsChan 通道，用于存储 speedtestresult 结构体
-	speedResultsChan := make(chan resultAddSpeed, len(resultChan))
-	// 创建 progressChan 和 doneChan 通道，启动 reportProgress 函数，用于报告进度
+	speedResultsChan := make(chan resultSpeed, len(ips))
+	// 创建 progressChan 和 doneChan 通道，启动一个协程用于报告进度
 	progressChan := make(chan int, 1)
-	doneChan := make(chan struct{})
-	go reportProgress(progressChan, len(resultChan), doneChan)
+	go func(progressChan chan int, total int) {
+		currentCount := 0
+		for count := range progressChan {
+			currentCount += count
+			percentage := float64(currentCount) / float64(total) * 100
+			timef("测速进度：%d / %d 已完成（%.2f%%）\r", currentCount, total, percentage)
+		}
+	}(progressChan, len(ips))
 
 	timef("开始执行 测速 测试\n")
-	for res := range resultChan {
+	for _, ip := range ips {
 		wg.Add(1)
 		thread <- struct{}{}
-		go func(res resultNoSpeed) {
+		go func(ip string) {
 			defer func() {
 				<-thread
 				wg.Done()
 			}()
 
-			speed, err := speedOnce(res.ip)
+			speed, err := speedOnce(ip)
 			if err != nil {
-				fmt.Printf("[%s] 测速失败: %v\n", res.ip, err)
-				speedResultsChan <- resultAddSpeed{resultNoSpeed: res}
+				fmt.Printf("[%s] 测速失败: %v\n", ip, err)
 			} else {
-				fmt.Printf("[%s] 测速结果: %.2f KB/s\n", res.ip, speed)
-				speedResultsChan <- resultAddSpeed{resultNoSpeed: res, downSpeed: speed}
+				fmt.Printf("[%s] 测速结果: %.2f KB/s\n", ip, speed)
+				speedResultsChan <- resultSpeed{ip: ip, downSpeed: speed}
 			}
 
 			// 进度+1
 			progressChan <- 1
-		}(res)
+		}(ip)
 	}
 
-	timef("正在等待 测速 结束...\n")
-	wg.Wait()
-	close(speedResultsChan)
-	close(progressChan)
-	// 等待 reportProgress 函数完成
-	<-doneChan
+	go func() {
+		timef("正在等待 测速 结束...\n")
+		wg.Wait()
+		close(speedResultsChan)
+		close(progressChan)
+		timef("测速已结束，正在统计数据...\n")
+	}()
 
-	timef("测速已结束，正在统计数据...\n")
-	results := []resultAddSpeed{}
+	results := []resultSpeed{}
 	for speedResult := range speedResultsChan {
 		results = append(results, speedResult)
 	}
@@ -628,20 +648,7 @@ func speedTests(resultChan chan resultNoSpeed) []resultAddSpeed {
 	return results
 }
 
-func reportProgress(progressChan chan int, total int, doneChan chan struct{}) {
-	currentCount := 0
-	for count := range progressChan {
-		currentCount += count
-		percentage := float64(currentCount) / float64(total) * 100
-		timef("%d / %d 已完成（%.2f%%）\r", currentCount, total, percentage)
-		if currentCount == total {
-			break
-		}
-	}
-	doneChan <- struct{}{}
-}
-
-func resultsToCSV(results []resultAddSpeed, tcpDead []string, outFileName string) {
+func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 	file, err := os.Create(outFileName)
 	if err != nil {
 		timef("无法创建文件: %v\n", err)
@@ -664,7 +671,7 @@ func resultsToCSV(results []resultAddSpeed, tcpDead []string, outFileName string
 	for _, res := range results {
 		// 有响应的记录
 		record := []string{
-			res.ip,
+			res.resultTCP.ip,
 			strconv.Itoa(res.port),
 			strconv.FormatBool(*forceTLS),
 			res.dataCenter,
@@ -732,6 +739,9 @@ func main() {
 		}
 	}
 
+	// 加载地址库
+	loadLocations()
+
 	// 从文件中读取 IP 地址
 	ips, err := readIPs(*ipFile)
 	if err != nil {
@@ -739,34 +749,54 @@ func main() {
 		return
 	}
 
-	// 加载地址库
-	locationMap, err := loadLocations()
-
 	// TCP测试
-	tcpAlive, tcpDead := tcpTests(ips)
+	resultAlive, ipDead := tcpTests(ips)
+	var ipAlive []string
+	for _, result := range resultAlive {
+		ipAlive = append(ipAlive, result.ip)
+	}
 
 	// HTTP和回源测试
-	resultChan := httpTests(tcpAlive, locationMap)
+	resultHTTPSlice := httpTests(ipAlive)
 
-	// if len(resultChan) == 0 {
-	// 	// 清除输出内容
-	// 	fmt.Print("\033[2J")
-	// 	timef("没有发现有效的IP\n")
-	// 	return
-	// }
-	// 上面这个写法是错的，len(resultChan)返回的是通道的容量
-
-	results := []resultAddSpeed{}
+	// 测速
+	var resultSpeedSlice []resultSpeed
 	if *doSpeedTest > 0 {
-		results = speedTests(resultChan)
+		resultSpeedSlice = speedTests(ipAlive)
+	}
+
+	// 初始化 resultMap
+	resultMap := make(map[string]*resultMerge)
+	for _, ip := range ipAlive {
+		resultMap[ip] = &resultMerge{}
+	}
+
+	// 合并 TCP 测试结果
+	for _, res := range resultAlive {
+		resultMap[res.ip].resultTCP = res
+	}
+
+	// 合并 HTTP 测试结果
+	for _, res := range resultHTTPSlice {
+		resultMap[res.ip].resultHTTP = res
+
+	}
+
+	// 合并 测速结果
+	for _, res := range resultSpeedSlice {
+		resultMap[res.ip].resultSpeed = res
+	}
+
+	var results []resultMerge
+	for _, res := range resultMap {
+		results = append(results, *res)
+	}
+	if *doSpeedTest > 0 {
 		// 根据下载速度排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].downSpeed > results[j].downSpeed
 		})
 	} else {
-		for res := range resultChan {
-			results = append(results, resultAddSpeed{resultNoSpeed: res})
-		}
 		// 根据TCP平均RTT排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].tcpRTTavg < results[j].tcpRTTavg
@@ -778,7 +808,7 @@ func main() {
 
 	// 输出结果到文件
 	outFileName := fmt.Sprintf("%s-%s.csv", *outFilePrefix, startTime.Format("20060102_150405"))
-	resultsToCSV(results, tcpDead, outFileName)
+	resultsToCSV(results, ipDead, outFileName)
 
 	timef("读入的IP总数: %d, 响应的记录总数: %d\n", len(ips), len(results))
 	timef("测试总耗时 %d 秒，结果写入文件 %s\n", time.Since(startTime)/time.Second, outFileName)
