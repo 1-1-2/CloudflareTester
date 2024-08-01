@@ -34,18 +34,19 @@ const (
 )
 
 var (
-	ipFile        = flag.String("ipin", "ip.txt", "IP地址文件名称")                                           // IP地址文件名称
-	outFilePrefix = flag.String("xout", "result", "输出文件前缀")                                             // 输出文件前缀
-	tcpPort       = flag.Int("tcport", 443, "端口")                                                       // 端口
-	maxThreads    = flag.Int("th", 100, "并发请求最大协程数")                                                    // 最大协程数
-	doSpeedTest   = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")                                             // 下载测速协程数量
-	speedTestURL  = flag.String("url", "https://speed.cloudflare.com/__down?bytes=500000000", "测速文件地址") // 测速文件地址
-	originTestURL = flag.String("origin", "", "回源测试地址，默认留空禁用")                                          // 回源测试地址
-	forceTLS      = flag.Bool("tls", false, "是否强制启用TLS")                                                // TLS是否启用
-	maxAttempt    = flag.Int("attempt", 5, "最大重试次数")                                                    // 各项测试最大重试次数
-	ipCounts      = 0                                                                                   // 存储读入的ip总数
-	startTime     = time.Now()                                                                          // 记录程序开始运行的时间
-	locationMap   = make(map[string]location)                                                           // 存储位置信息
+	ipFile        = flag.String("ipin", "ip.txt", "IP地址文件名")
+	outFilePrefix = flag.String("xout", "result", "输出文件前缀")
+	tcpPort       = flag.Int("tcport", 443, "TCP测试端口")
+	maxThreads    = flag.Int("th", 100, "并发请求最大协程数")
+	doSpeedTest   = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")
+	speedTestURL  = flag.String("spdurl", "https://speed.cloudflare.com/__down?bytes=500000000", "测速文件地址")
+	originTestURL = flag.String("origin", "", "回源测试地址，支持英文逗号分隔的多个目标，默认留空禁用")
+	forceTLS      = flag.Bool("tls", false, "是否强制启用TLS")
+	maxAttempt    = flag.Int("attempt", 5, "最大重试次数")
+	ipCounts      = 0                         // 读入的IP地址数量
+	startTime     = time.Now()                // 程序开始时间
+	locationMap   = make(map[string]location) // 机场码与地理位置的映射
+	originURLs    []string                    // 分割后的回源测试目标URL
 )
 
 type resultTCP struct {
@@ -60,12 +61,12 @@ type resultTCP struct {
 }
 
 type resultHTTP struct {
-	ip         string        // IP地址
-	dataCenter string        // 数据中心
-	region     string        // 地区
-	city       string        // 城市
-	httpRTT    time.Duration // HTTP请求延迟
-	originRTT  time.Duration // 回源测试延迟
+	ip         string                   // IP地址
+	dataCenter string                   // 数据中心
+	region     string                   // 地区
+	city       string                   // 城市
+	httpRTT    time.Duration            // HTTP请求延迟
+	originRTT  map[string]time.Duration // 回源测试延迟（多个目标）
 }
 
 type resultSpeed struct {
@@ -459,8 +460,8 @@ func httpTraceOnce(ip string) (time.Duration, *bytes.Buffer, error) {
 }
 
 // httpOriginOnce 执行回源时间测试并返回持续时间
-func httpOriginOnce(ip string) (time.Duration, error) {
-	URL, port := genURL(*originTestURL)
+func httpOriginOnce(ip string, oriURL string) (time.Duration, error) {
+	URL, port := genURL(oriURL)
 	for attempts := 0; attempts < *maxAttempt; attempts++ {
 		startTime := time.Now()
 		client, req, err := genClient(ip, port, URL)
@@ -511,11 +512,13 @@ func httpTests(ips []string) []resultHTTP {
 			}
 
 			// 回源测试
-			originRTT := time.Duration(0)
-			if *originTestURL != "" {
-				originRTT, err = httpOriginOnce(ip)
+			originRTTs := make(map[string]time.Duration)
+			for _, url := range originURLs {
+				rtt, err := httpOriginOnce(ip, url)
 				if err != nil {
-					fmt.Printf("[%s] 回源测试失败: %v\n", ip, err)
+					fmt.Printf("[%s] 回源(%s)测试失败: %v\n", ip, url, err)
+				} else {
+					originRTTs[url] = rtt
 				}
 			}
 
@@ -538,12 +541,16 @@ func httpTests(ips []string) []resultHTTP {
 				region:     region,
 				city:       city,
 				httpRTT:    httpRTT,
-				originRTT:  originRTT,
+				originRTT:  originRTTs,
 			}
 			resultHTTPChan <- result
 
-			fmt.Printf("[%s] HTTP-RTT %d ms，回源RTT %d ms，数据中心: %s, 地区: %s, 城市: %s\n",
-				ip, httpRTT.Milliseconds(), originRTT.Milliseconds(), dataCenter, region, city)
+			fmt.Printf("[%s] HTTP-RTT %d ms，数据中心: %s, 地区: %s, 城市: %s",
+				ip, httpRTT.Milliseconds(), dataCenter, region, city)
+			for url, rtt := range originRTTs {
+				fmt.Printf(", 回源RTT(%s): %d ms", url, rtt.Milliseconds())
+			}
+			fmt.Println()
 		}(ip)
 	}
 
@@ -665,7 +672,10 @@ func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 
 	// 写入 CSV 头部
 	header := []string{"IP地址", "端口", "TLS", "数据中心", "地区", "城市",
-		"TCP Reach", "RTT min", "RTT avg", "RTT max", "HTTP RTT", "回源 RTT"}
+		"TCP Reach", "RTT min", "RTT avg", "RTT max", "HTTP RTT"}
+	for _, url := range originURLs {
+		header = append(header, fmt.Sprintf("回源%s", url))
+	}
 	if *doSpeedTest > 0 {
 		header = append(header, "下载速度")
 	}
@@ -686,8 +696,16 @@ func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 			fmt.Sprintf("%d", res.tcpRTTavg.Milliseconds()),
 			fmt.Sprintf("%d", res.tcpRTTmax.Milliseconds()),
 			fmt.Sprintf("%d", res.httpRTT.Milliseconds()),
-			fmt.Sprintf("%d", res.originRTT.Milliseconds()),
 		}
+		// 回源 RTT 数据
+		for _, url := range originURLs {
+			if rtt, ok := res.originRTT[url]; ok {
+				record = append(record, fmt.Sprintf("%d", rtt.Milliseconds()))
+			} else {
+				record = append(record, "N/A")
+			}
+		}
+		// 测速数据
 		if *doSpeedTest > 0 {
 			record = append(record, fmt.Sprintf("%.0f", res.downSpeed))
 		}
@@ -695,7 +713,7 @@ func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 	}
 	for _, ip := range tcpDead {
 		// 没得响应的记录
-		writer.Write([]string{ip, "", "", "", "", "", "不可达", "", "", "", ""})
+		writer.Write([]string{ip, "", "", "", "", "", "不可达"})
 	}
 }
 
@@ -752,6 +770,15 @@ func ulimitLinux() {
 
 func main() {
 	flag.Parse()
+	// 解析回源测试URL
+	if *originTestURL != "" {
+		for _, url := range strings.Split(*originTestURL, ",") {
+			if url != "" {
+				originURLs = append(originURLs, url)
+			}
+		}
+	}
+	timef("解析到 %d 个回源测试目标：%v\n", len(originURLs), originURLs)
 
 	// 设置控制台运行标题
 	terminalTitle(fmt.Sprintf("[CFtester]%s To %s", *ipFile, *outFilePrefix))
@@ -793,40 +820,41 @@ func main() {
 		resultMap[ip] = &resultMerge{}
 	}
 
-	// 合并 TCP 测试结果
+	// resultMap <- TCP 测试结果
 	for _, res := range resultAlive {
 		resultMap[res.ip].resultTCP = res
 	}
 
-	// 合并 HTTP 测试结果
+	// resultMap <- HTTP 测试结果
 	for _, res := range resultHTTPSlice {
 		resultMap[res.ip].resultHTTP = res
 
 	}
 
-	// 合并 测速结果
+	// resultMap <- 测速结果
 	for _, res := range resultSpeedSlice {
 		resultMap[res.ip].resultSpeed = res
 	}
 
+	// resultMap 转 slice，排序
 	var results []resultMerge
 	for _, res := range resultMap {
 		results = append(results, *res)
 	}
 	if *doSpeedTest > 0 {
-		// 根据下载速度排序
+		// 根据下载速度，降序排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].downSpeed > results[j].downSpeed
 		})
 	} else {
-		// 根据TCP平均RTT排序
+		// 根据TCP平均RTT，升序排序
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].tcpRTTavg < results[j].tcpRTTavg
 		})
 	}
 
 	// 清除输出内容
-	clearConsole()
+	// clearConsole()
 
 	// 输出结果到文件
 	outFileName := fmt.Sprintf("%s-%s.csv", *outFilePrefix, startTime.Format("20060102_150405"))
