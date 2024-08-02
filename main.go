@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -88,6 +87,102 @@ type location struct {
 	Cca2   string  `json:"cca2"`
 	Region string  `json:"region"`
 	City   string  `json:"city"`
+}
+
+type httpPool struct {
+	clientPool chan *http.Client        // HTTP客户端池
+	reqMap     map[string]*http.Request // URL与请求的映射
+	dialer     *net.Dialer              // 自定义Dialer
+	once       sync.Once                // 用于保证初始化只执行一次
+}
+
+// 初始化客户端池和自定义Dialer
+func (cp *httpPool) init() {
+	cp.once.Do(func() {
+		// 初始化客户端池
+		cp.clientPool = make(chan *http.Client, *maxThreads)
+		for i := 0; i < *maxThreads; i++ {
+			transport := &http.Transport{DisableKeepAlives: true}
+			client := &http.Client{
+				Transport: transport,
+				Timeout:   httpTimeout,
+			}
+			cp.clientPool <- client
+		}
+		// 初始化自定义Dialer
+		cp.dialer = &net.Dialer{
+			Timeout:   tcpTimeout, // 设置超时时间
+			KeepAlive: 0,          // 关闭 keepalive
+		}
+		// 初始化请求映射
+		cp.reqMap = make(map[string]*http.Request)
+	})
+}
+
+// 将客户端返回到池中
+func (cp *httpPool) returnClient(client *http.Client) {
+	cp.clientPool <- client
+}
+
+// 维护请求集合
+func (cp *httpPool) appendReqMap(url string) error {
+	req, err := http.NewRequest("GET", url, http.NoBody)
+	if err != nil {
+		return err
+	}
+	// 设置请求头
+	req.Header.Set("User-Agent", UA)
+	// 完成请求后关闭连接
+	req.Close = true
+	// 入库
+	cp.reqMap[url] = req
+
+	return nil
+}
+
+// 获取客户端并发起请求，包含maxAttempt次重试
+func (cp *httpPool) requestAttempt(ip string, port int, url string, reqTag string, needResBody bool) (time.Duration, []byte, error) {
+	// 取出一个client，设置自定义的DialContext
+	client := <-cp.clientPool
+	defer cp.returnClient(client) // 结束后将client归还
+	client.Transport.(*http.Transport).DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return cp.dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	}
+
+	// 取出对应的请求
+	req := cp.reqMap[url]
+
+	// 发起请求
+	for attempts := 0; attempts < *maxAttempt; attempts++ {
+		startTime := time.Now()
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if os.IsTimeout(err) {
+				fmt.Printf("[%s] %s请求(第%d次)超时: %v\n", ip, reqTag, attempts+1, err)
+			} else {
+				fmt.Printf("[%s] %s请求(第%d次)失败: %v\n", ip, reqTag, attempts+1, err)
+			}
+			continue
+		}
+		defer resp.Body.Close()
+
+		duration := time.Since(startTime)
+
+		if needResBody {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Printf("[%s] %s请求(第%d次)读取响应体失败: %v\n", ip, reqTag, attempts+1, err)
+				continue
+			}
+			return duration, body, nil
+		} else {
+			return duration, nil, nil
+		}
+
+	}
+
+	return 0, nil, fmt.Errorf("%s请求全部超时", reqTag)
 }
 
 // 带时间前缀的printf
@@ -373,8 +468,8 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 	return resultAlive, ipDead
 }
 
-// genURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
-func genURL(oriURL string) (string, int) {
+// rectifyURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
+func rectifyURL(oriURL string) (string, int) {
 	if strings.HasPrefix(oriURL, "https://") {
 		return oriURL, 443
 	}
@@ -393,102 +488,22 @@ func genURL(oriURL string) (string, int) {
 	}
 }
 
-// 公共函数，用于创建 HTTP 客户端和请求
-func genClient(ip string, port int, url string) (*http.Client, *http.Request, error) {
-	// 创建一个用于拨号的结构体
-	dialer := &net.Dialer{
-		Timeout:   tcpTimeout, // 设置超时时间
-		KeepAlive: 0,          // 关闭 keepalive
-	}
-	// 创建一个 http 传输结构体
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// 使用拨号结构体连接到指定的 ip 和端口
-			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
-		},
-	}
-	// 创建一个 http 客户端
-	client := &http.Client{
-		Transport: transport,   // 设置传输结构体
-		Timeout:   httpTimeout, // 设置超时时间
-	}
-	// 创建一个 http 请求
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	// 设置请求头
-	req.Header.Set("User-Agent", UA)
-	// 关闭请求
-	req.Close = true
-	return client, req, nil
-}
-
-// httpTraceOnce 执行官方节点测试并返回持续时间
-func httpTraceOnce(ip string) (time.Duration, *bytes.Buffer, error) {
-	URL, port := genURL(traceURL)
-	for attempts := 0; attempts < *maxAttempt; attempts++ {
-		startTime := time.Now()
-
-		client, req, err := genClient(ip, port, URL)
-		if err != nil {
-			return 0, nil, err
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			if os.IsTimeout(err) {
-				fmt.Printf("[%s] trace请求(第%d次)超时: %v\n", ip, attempts+1, err)
-			} else {
-				fmt.Printf("[%s] trace请求(第%d次)失败: %v\n", ip, attempts+1, err)
-			}
-			continue
-		}
-		defer resp.Body.Close()
-
-		duration := time.Since(startTime)
-		buf := &bytes.Buffer{}
-		_, err = io.Copy(buf, resp.Body)
-		if err != nil {
-			fmt.Printf("[%s] trace请求(第%d次)读取响应体失败: %v\n", ip, attempts+1, err)
-			continue
-		}
-
-		return duration, buf, nil
-	}
-	return 0, nil, fmt.Errorf("trace请求全部超时")
-}
-
-// httpOriginOnce 执行回源时间测试并返回持续时间
-func httpOriginOnce(ip string, oriURL string) (time.Duration, error) {
-	URL, port := genURL(oriURL)
-	for attempts := 0; attempts < *maxAttempt; attempts++ {
-		startTime := time.Now()
-		client, req, err := genClient(ip, port, URL)
-		if err != nil {
-			return 0, err
-		}
-		req.Body = http.NoBody // 不关注响应，设置请求体为空
-
-		resp, err := client.Do(req)
-		if err != nil {
-			if os.IsTimeout(err) {
-				fmt.Printf("[%s] 回源请求(第%d次)超时: %v\n", ip, attempts+1, err)
-			} else {
-				fmt.Printf("[%s] 回源请求(第%d次)失败: %v\n", ip, attempts+1, err)
-			}
-			continue
-		}
-		defer resp.Body.Close()
-
-		duration := time.Since(startTime)
-		return duration, nil
-	}
-	return 0, fmt.Errorf("回源请求全部超时")
-}
-
 // HTTP 和回源测试部分
-func httpTests(ips []string) []resultHTTP {
+func httpTests(ips []string, hp *httpPool) []resultHTTP {
+	// 获得修整后的traceURL
+	rectifyTraceURL, tracePort := rectifyURL(traceURL)
+	hp.appendReqMap(rectifyTraceURL)
+	type oriPair struct {
+		URL  string
+		port int
+	}
+	// 获得修整后的回源URL集合
+	rectifyOriginURLs := make([]oriPair, len(originURLs))
+	for i, url := range originURLs {
+		rectifyOriginURLs[i].URL, rectifyOriginURLs[i].port = rectifyURL(url)
+		hp.appendReqMap(rectifyOriginURLs[i].URL)
+	}
+
 	var wg sync.WaitGroup
 	thread := make(chan struct{}, *maxThreads)
 	resultHTTPChan := make(chan resultHTTP, len(ips))
@@ -506,24 +521,24 @@ func httpTests(ips []string) []resultHTTP {
 			}()
 
 			// HTTP 测试
-			httpRTT, body, err := httpTraceOnce(ip)
+			httpRTT, body, err := hp.requestAttempt(ip, tracePort, rectifyTraceURL, "HTTP", true)
 			if err != nil {
 				fmt.Printf("[%s] HTTP测试失败: %v\n", ip, err)
 			}
 
 			// 回源测试
 			originRTTs := make(map[string]time.Duration)
-			for _, url := range originURLs {
-				rtt, err := httpOriginOnce(ip, url)
+			for _, pair := range rectifyOriginURLs {
+				rtt, _, err := hp.requestAttempt(ip, pair.port, pair.URL, "回源", false)
 				if err != nil {
-					fmt.Printf("[%s] 回源(%s)测试失败: %v\n", ip, url, err)
+					fmt.Printf("[%s] 回源(%s)测试失败: %v\n", ip, pair.URL, err)
 				} else {
-					originRTTs[url] = rtt
+					originRTTs[pair.URL] = rtt
 				}
 			}
 
 			var dataCenter, region, city string
-			if matches := re.FindStringSubmatch(body.String()); len(matches) > 1 {
+			if matches := re.FindStringSubmatch(string(body)); len(matches) > 1 {
 				Colo := matches[1]
 				if loc, ok := locationMap[Colo]; ok {
 					dataCenter = Colo
@@ -570,18 +585,47 @@ func httpTests(ips []string) []resultHTTP {
 	return resultHTTPSlice
 }
 
+// 公共函数，用于创建 HTTP 客户端和请求
+func genClient(ip string, port int, url string, timeout time.Duration) (*http.Client, *http.Request, error) {
+	// 创建一个用于拨号的结构体
+	dialer := &net.Dialer{
+		Timeout:   tcpTimeout, // 设置超时时间
+		KeepAlive: 0,          // 关闭 keepalive
+	}
+	// 创建一个 http 传输结构体
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// 使用拨号结构体连接到指定的 ip 和端口
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+		},
+	}
+	// 创建一个 http 客户端
+	client := &http.Client{
+		Transport: transport, // 设置传输结构体
+		Timeout:   timeout,   // 设置超时时间
+	}
+	// 创建一个 http 请求
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 设置请求头
+	req.Header.Set("User-Agent", UA)
+	// 关闭请求
+	req.Close = true
+	return client, req, nil
+}
+
 // 重构后的 speedOnce 函数
 func speedOnce(ip string) (float64, error) {
-	URL, port := genURL(*speedTestURL)
+	URL, port := rectifyURL(*speedTestURL)
 	speedAttempts := 3
 	for attempts := 0; attempts < speedAttempts; attempts++ {
 		startTime := time.Now()
-		client, req, err := genClient(ip, port, URL)
+		client, req, err := genClient(ip, port, URL, downloadDuration)
 		if err != nil {
 			return 0, err
 		}
-		// 修改 client 的超时时间为 downloadDuration
-		client.Timeout = downloadDuration
 
 		timef("启动 [%s:%d] 测速(第%d次)\n", ip, port, attempts+1)
 
@@ -806,7 +850,9 @@ func main() {
 	}
 
 	// HTTP和回源测试
-	resultHTTPSlice := httpTests(ipAlive)
+	hp := new(httpPool)
+	hp.init()
+	resultHTTPSlice := httpTests(ipAlive, hp)
 
 	// 测速
 	var resultSpeedSlice []resultSpeed
