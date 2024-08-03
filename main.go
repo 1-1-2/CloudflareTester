@@ -411,7 +411,7 @@ type httpRes struct {
 	err      error
 }
 
-func httpWorker(timeout time.Duration, limRetries int, jobs <-chan httpJob, results chan<- httpRes, wg *sync.WaitGroup, reqMAP map[string]*http.Request) {
+func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.Request, jobs <-chan httpJob, results chan<- httpRes, wg *sync.WaitGroup) {
 	// 创建一个用于拨号的结构体
 	dialer := &net.Dialer{
 		Timeout:   tcpTimeout, // 设置超时时间
@@ -485,6 +485,7 @@ func (mp *requestMap) appendRequest(url string) {
 // HTTP 和回源测试部分
 func httpTests(ips []string) map[string]*resultHTTP {
 	reqMap := new(requestMap)
+	reqMap.reqMap = make(map[string]*http.Request)
 
 	// 获得修整后的traceURL
 	rectifyTraceURL, tracePort := rectifyURL(traceURL)
@@ -507,7 +508,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 	// 启动工作者
 	timef("正在启动HTTP worker\n")
 	for w := 0; w < *maxThreads; w++ {
-		go httpWorker(httpTimeout, *maxRetries, jobChan, respondChan, &wg, reqMap.reqMap)
+		go httpWorker(httpTimeout, *maxRetries, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
 
 	re := regexp.MustCompile(`colo=([A-Z]+)`)
@@ -538,6 +539,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 		result, exists := resultMap[rsd.ip]
 		if !exists {
 			// resultMap[rsd.ip] = resultHTTP{ip: rsd.ip}
+			resultMap[rsd.ip] = new(resultHTTP)
 			result = resultMap[rsd.ip]
 		}
 		// 根据请求类型处理结果输出
@@ -559,9 +561,15 @@ func httpTests(ips []string) map[string]*resultHTTP {
 				}
 			}
 		case "回源":
-			// 记录回源 RTT
-			result.originRTTs[rsd.url] = rsd.duration
-			fmt.Printf("[%s] 回源RTT(%s): %d ms", rsd.ip, rsd.url, rsd.duration.Milliseconds())
+			if result.originRTTs == nil {
+				// 新增回源 RTT 记录
+				result.originRTTs = make(map[string]time.Duration)
+				result.originRTTs[rsd.url] = rsd.duration
+			} else {
+				// 增写回源 RTT 记录
+				result.originRTTs[rsd.url] = rsd.duration
+				fmt.Printf("[%s] 回源RTT(%s): %d ms", rsd.ip, rsd.url, rsd.duration.Milliseconds())
+			}
 		}
 	}
 
