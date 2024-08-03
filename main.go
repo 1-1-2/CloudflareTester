@@ -411,7 +411,7 @@ type httpRes struct {
 	err      error
 }
 
-func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.Request, jobs <-chan httpJob, results chan<- httpRes, wg *sync.WaitGroup) {
+func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.Request, jobChan <-chan httpJob, respondChan chan<- httpRes, wg *sync.WaitGroup) {
 	// 创建一个用于拨号的结构体
 	dialer := &net.Dialer{
 		Timeout:   tcpTimeout, // 设置超时时间
@@ -424,12 +424,13 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 		Timeout:   timeout,   // 设置超时时间
 	}
 
-	for job := range jobs {
+	for job := range jobChan {
 		// 设置请求的 IP 和端口
 		client.Transport.(*http.Transport).DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(job.ip, strconv.Itoa(job.port)))
 		}
 
+		good := false
 		for retry := 0; retry < limRetries; retry++ {
 			req := reqMAP[job.url]
 			startTime := time.Now()
@@ -448,19 +449,29 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 			duration := time.Since(startTime)
 
 			if job.needResBody {
+				// 需要响应体，应该是trace请求
 				body, err := io.ReadAll(resp.Body)
 				if err != nil {
 					fmt.Printf("[%s] %s请求(第%d次)读取响应体失败: %v\n", job.ip, job.reqTag, retry+1, err)
 					continue
 				}
-				results <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, body: body}
+				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, body: body}
+				good = true
 				break
 			} else {
-				results <- httpRes{ip: job.ip, reqTag: job.reqTag, url: job.url, duration: duration}
+				// 不需要响应体，应该是回源请求
+				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, url: job.url}
+				good = true
 				break
 			}
 		}
-		results <- httpRes{ip: job.ip, reqTag: job.reqTag, err: fmt.Errorf("%s请求全部超时", job.reqTag)}
+		if !good {
+			// 全部超时
+			respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, err: fmt.Errorf("请求全部超时")}
+		} else {
+			// 重置标志
+			good = false
+		}
 		wg.Done()
 	}
 }
@@ -484,6 +495,7 @@ func (mp *requestMap) appendRequest(url string) {
 
 // HTTP 和回源测试部分
 func httpTests(ips []string) map[string]*resultHTTP {
+	// 初始化请求集合
 	reqMap := new(requestMap)
 	reqMap.reqMap = make(map[string]*http.Request)
 
@@ -498,6 +510,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 	rectifyOriginURLs := make([]oriPair, len(originURLs))
 	for i, url := range originURLs {
 		rectifyOriginURLs[i].URL, rectifyOriginURLs[i].port = rectifyURL(url)
+		originURLs[i] = rectifyOriginURLs[i].URL
 		reqMap.appendRequest(rectifyOriginURLs[i].URL)
 	}
 	jobPerIP := 1 + len(originURLs)
@@ -511,8 +524,6 @@ func httpTests(ips []string) map[string]*resultHTTP {
 		go httpWorker(httpTimeout, *maxRetries, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
 
-	re := regexp.MustCompile(`colo=([A-Z]+)`)
-
 	timef("开始执行 HTTP和回源 测试\n")
 	for _, ip := range ips {
 		wg.Add(jobPerIP)
@@ -520,8 +531,8 @@ func httpTests(ips []string) map[string]*resultHTTP {
 		jobChan <- httpJob{ip, tracePort, rectifyTraceURL, "HTTP", true}
 
 		// 回源测试
-		for _, pair := range rectifyOriginURLs {
-			jobChan <- httpJob{ip, pair.port, pair.URL, "回源", false}
+		for _, ori := range rectifyOriginURLs {
+			jobChan <- httpJob{ip, ori.port, ori.URL, "回源", false}
 		}
 	}
 
@@ -532,9 +543,14 @@ func httpTests(ips []string) map[string]*resultHTTP {
 		timef("HTTP 测试已结束，正在等待数据整理...\n")
 	}()
 
-	// 处理结果
+	// 从respondChan中读取结果并整理
 	var resultMap = make(map[string]*resultHTTP)
+	re := regexp.MustCompile(`colo=([A-Z]+)`)
 	for rsd := range respondChan {
+		if rsd.err != nil {
+			fmt.Printf("[%s] %s测试失败: %v\n", rsd.ip, rsd.reqTag, rsd.err)
+			continue
+		}
 		// 检出结果或初始化
 		result, exists := resultMap[rsd.ip]
 		if !exists {
@@ -568,7 +584,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 			} else {
 				// 增写回源 RTT 记录
 				result.originRTTs[rsd.url] = rsd.duration
-				fmt.Printf("[%s] 回源RTT(%s): %d ms", rsd.ip, rsd.url, rsd.duration.Milliseconds())
+				fmt.Printf("[%s] 回源RTT(%s): %d ms\n", rsd.ip, rsd.url, rsd.duration.Milliseconds())
 			}
 		}
 	}
