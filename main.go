@@ -290,18 +290,15 @@ type tcpRes struct {
 // tcpWorker 执行TCP拨号并返回持续时间
 func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) {
 	for ip := range ipChan {
-		// 创建一个带超时的 context
-		ctx, cancel := context.WithTimeout(context.Background(), timeoutTCP)
-
 		// 创建一个带超时的 dialer
 		dialer := &net.Dialer{
 			Timeout:   timeoutTCP,
-			KeepAlive: 0, // 不保留链接，每次请求都建立一个新的TCP连接
+			KeepAlive: -1, // If negative, keep-alive probes are disabled
 		}
 
 		// 使用自定义拨号器拨号
 		start := time.Now()
-		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
+		conn, err := dialer.DialContext(context.Background(), "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
 		duration := time.Since(start)
 		if err == nil {
 			conn.Close()
@@ -309,7 +306,6 @@ func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) 
 		} else {
 			rspChan <- tcpRes{ip: ip, err: err}
 		}
-		cancel()
 		wg.Done()
 	}
 }
@@ -318,12 +314,13 @@ func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) 
 func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 	var wg sync.WaitGroup
 	jobChan := make(chan string, len(ips)**retryTCP)
-	respondChan := make(chan tcpRes, *threadTCP)
+	thisThread := min(*threadTCP, len(ips))
+	respondChan := make(chan tcpRes, thisThread)
 
 	timef("TCP连通性 测试, 共 %d 个目标，每个目标%d次重试\n", len(ips), *retryTCP)
 	// 启动工作者
 	timef("正在启动 TCP worker\n")
-	for w := 0; w < *threadTCP; w++ {
+	for w := 0; w < thisThread; w++ {
 		go tcpWorker(jobChan, respondChan, &wg)
 	}
 
@@ -444,8 +441,9 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 	// 创建一个用于拨号的结构体
 	dialer := &net.Dialer{
 		Timeout:   timeoutTCP, // 设置超时时间
-		KeepAlive: 0,          // 关闭 keepalive
+		KeepAlive: -1,         // 关闭 keep-alive probe
 	}
+
 	// 创建一个 http 客户端，使用默认的 Transport
 	transport := &http.Transport{DisableKeepAlives: true}
 	client := &http.Client{
@@ -455,6 +453,7 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 
 	for job := range jobChan {
 		// 设置请求的 IP 和端口
+		// DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 		client.Transport.(*http.Transport).DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(job.ip, strconv.Itoa(job.port)))
 		}
@@ -553,10 +552,11 @@ func httpTests(ips []string, locationMap map[string]location) map[string]*result
 
 	var wg sync.WaitGroup
 	jobChan := make(chan httpJob, len(ips)*jobPerIP)
-	respondChan := make(chan httpRes, *threadHTTP)
+	thisThread := min(*threadHTTP, len(ips))
+	respondChan := make(chan httpRes, thisThread)
 	// 启动工作者
 	timef("正在启动 HTTP worker\n")
-	for w := 0; w < *threadHTTP; w++ {
+	for w := 0; w < thisThread; w++ {
 		go httpWorker(timeoutHTTP, *retryHTTP, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
 
@@ -642,10 +642,11 @@ func speedTests(ips []string) []resultSpeed {
 
 	var wg sync.WaitGroup
 	jobChan := make(chan httpJob, len(ips))
-	respondChan := make(chan httpRes, *threadSpeed)
+	thisThread := min(*threadSpeed, len(ips))
+	respondChan := make(chan httpRes, thisThread)
 	// 启动工作者
 	timef("正在启动 HTTP worker\n")
-	for w := 0; w < *threadSpeed; w++ {
+	for w := 0; w < thisThread; w++ {
 		go httpWorker(timeDownload, *retrySpeed, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
 
@@ -798,6 +799,13 @@ func main() {
 	timeoutTCP = time.Duration(*toTCP) * time.Millisecond
 	timeoutHTTP = time.Duration(*toHTTP) * time.Millisecond
 	timeDownload = time.Duration(*tDown) * time.Second
+	// 打印设置信息
+	fmt.Print("本次测试设置如下：\n")
+	fmt.Printf("回源测试目标: %v\n", *urlOrigin)
+	fmt.Printf("是否启用测速: %v\n", *threadSpeed > 0)
+	fmt.Printf("是否强制使用TLS: %v\n", *forceTLS)
+	fmt.Printf("TCP超时: %d ms，HTTP超时: %d ms，测速时间: %d s\n", *toTCP, *toHTTP, *tDown)
+	fmt.Printf("TCP并发: %d，HTTP并发: %d，测速并发: %d\n", *threadTCP, *threadHTTP, *threadSpeed)
 
 	// 解析回源测试URL
 	if *urlOrigin != "" {
