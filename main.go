@@ -797,7 +797,7 @@ func main() {
 	flag.Parse()
 	timeoutTCP = time.Duration(*toTCP) * time.Millisecond
 	timeoutHTTP = time.Duration(*toHTTP) * time.Millisecond
-	timeDownload = time.Duration(*tDown) * time.Millisecond
+	timeDownload = time.Duration(*tDown) * time.Second
 
 	// 解析回源测试URL
 	if *urlOrigin != "" {
