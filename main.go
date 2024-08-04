@@ -294,10 +294,10 @@ func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) 
 		start := time.Now()
 		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
 		duration := time.Since(start)
-		if err != nil {
+		if err == nil {
+			conn.Close()
 			rspChan <- tcpRes{ip: ip, rtt: duration}
 		} else {
-			conn.Close()
 			rspChan <- tcpRes{ip: ip, err: err}
 		}
 		cancel()
@@ -344,10 +344,11 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 			aliveStats[rsd.ip] = &resultTCP{
 				// ip:        ip,
 				port:      *tcpPort,
-				tcpRTTmin: time.Duration(math.MaxInt64), // 初始化为最大值
+				tcpRTTmin: time.Duration(math.MaxInt64), // 用最大值初始化
 			}
 			stat = aliveStats[rsd.ip]
 		}
+		// 根据响应更新统计信息
 		if rsd.err == nil {
 			// 正常响应
 			stat.tcpReach++
@@ -361,7 +362,7 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 		} else {
 			// 响应超时
 			stat.tcpFailed++
-			fmt.Printf("[%s] TCP连接失败(第%d/共%d次): %v\n", rsd.ip, stat.tcpFailed, *maxRetries, rsd.err)
+			fmt.Printf("[%s] TCP连接失败(%d成功/%d失败): %v\n", rsd.ip, stat.tcpReach, stat.tcpFailed, rsd.err)
 		}
 	}
 
@@ -374,9 +375,9 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 				stat.tcpRTTavg = stat.tcpRTTsum / time.Duration(stat.tcpReach)
 				stat.reachRatio = float64(stat.tcpReach) / float64(*maxRetries) * 100
 
-				// fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms\n",
-				// 	stats.ip, stats.reachRatio, stats.tcpRTTmin.Milliseconds(),
-				// 	stats.tcpRTTavg.Milliseconds(), stats.tcpRTTmax.Milliseconds())
+				fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms\n",
+					ip, stat.reachRatio, stat.tcpRTTmin.Milliseconds(),
+					stat.tcpRTTavg.Milliseconds(), stat.tcpRTTmax.Milliseconds())
 			} else {
 				// 被记录的异常响应
 				timef("哪里出了错，%s 没有测试结果？\n", ip)
@@ -466,6 +467,7 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 
 			duration := time.Since(startTime)
 
+			// 按请求标的处理响应
 			switch job.purpose {
 			case "body":
 				// 需要响应体，应该是trace请求
@@ -475,21 +477,21 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 					continue
 				}
 				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, body: body}
-				good = true
-				break
 			case "rttonly":
 				// 不需要响应体，应该是回源请求
 				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, url: job.url}
-				good = true
-				break
 			case "speed":
 				// 需要响应体长度，应该是测速请求
-				written, _ := io.Copy(io.Discard, resp.Body)
+				written, _ := io.Copy(io.Discard, resp.Body) // _:忽略大概率会有的超时提示
 				speed := float64(written) / duration.Seconds() / 1024
 				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, downSpeed: speed}
 			}
-			resp.Body.Close() // 关闭响应体
+			// 走到这里的都是好请求，关闭响应体给个good，跳出循环
+			resp.Body.Close()
+			good = true
+			break
 		}
+		// 判断是break还是重试次数用尽
 		if !good {
 			// 全部超时
 			respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, err: fmt.Errorf("请求全部超时")}
@@ -544,7 +546,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 	jobChan := make(chan httpJob, len(ips)*jobPerIP)
 	respondChan := make(chan httpRes, *maxThreads)
 	// 启动工作者
-	timef("正在启动HTTP worker\n")
+	timef("正在启动 HTTP worker\n")
 	for w := 0; w < *maxThreads; w++ {
 		go httpWorker(httpTimeout, *maxRetries, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
@@ -561,7 +563,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 		}
 	}
 	go func() {
-		timef("正在等待 HTTP 测试结束...\n")
+		timef("任务队列构建完毕，正在等待 HTTP 测试结束...\n")
 		wg.Wait()
 		close(jobChan)
 		close(respondChan)
@@ -609,7 +611,7 @@ func httpTests(ips []string) map[string]*resultHTTP {
 			} else {
 				// 增写回源 RTT 记录
 				result.originRTTs[rsd.url] = rsd.duration
-				fmt.Printf("[%s] 回源RTT(%s): %d ms\n", rsd.ip, rsd.url, rsd.duration.Milliseconds())
+				fmt.Printf("[%s] 回源(%s)RTT: %d ms\n", rsd.ip, rsd.url, rsd.duration.Milliseconds())
 			}
 		}
 	}
@@ -633,7 +635,7 @@ func speedTests(ips []string) []resultSpeed {
 	jobChan := make(chan httpJob, len(ips))
 	respondChan := make(chan httpRes, *maxThreads)
 	// 启动工作者
-	timef("正在启动HTTP worker\n")
+	timef("正在启动 HTTP worker\n")
 	for w := 0; w < *maxThreads; w++ {
 		go httpWorker(downloadDuration, speedRetries, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
@@ -642,10 +644,10 @@ func speedTests(ips []string) []resultSpeed {
 	for _, ip := range ips {
 		wg.Add(1)
 		// HTTP 测试
-		jobChan <- httpJob{ip, speedPort, rectifyspeedURL, "速度", "speed"}
+		jobChan <- httpJob{ip, speedPort, rectifyspeedURL, "测速", "speed"}
 	}
 	go func() {
-		timef("正在等待 速度 测试结束...\n")
+		timef("任务队列构建完毕，正在等待 速度 测试结束...\n")
 		wg.Wait()
 		close(jobChan)
 		close(respondChan)
@@ -655,13 +657,19 @@ func speedTests(ips []string) []resultSpeed {
 	doneCount := 0
 	total := len(ips)
 	resultSlice := make([]resultSpeed, 0)
-	for res := range respondChan {
+	for rsd := range respondChan {
 		// 报告进度
 		doneCount++
 		percentage := float64(doneCount) / float64(total) * 100
-		timef("测速进度：%d / %d 已完成（%.2f%%）\r", doneCount, total, percentage)
+		timef("测速进度：%d / %d 已完成（%.2f%%）\n", doneCount, total, percentage)
 		// 记录结果
-		resultSlice = append(resultSlice, resultSpeed{ip: res.ip, downSpeed: res.downSpeed})
+		speed, err := rsd.downSpeed, rsd.err
+		if err != nil {
+			fmt.Printf("[%s] 测速失败: %v\n", rsd.ip, err)
+		} else {
+			fmt.Printf("[%s] 测速结果: %.2f KB/s\n", rsd.ip, speed)
+			resultSlice = append(resultSlice, resultSpeed{ip: rsd.ip, downSpeed: speed})
+		}
 	}
 
 	return resultSlice
