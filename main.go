@@ -53,6 +53,7 @@ type resultTCP struct {
 	// ip         string        // IP地址
 	port       int           // 端口
 	tcpReach   int           // TCP请求成功次数
+	tcpFailed  int           // TCP请求失败次数
 	reachRatio float64       // TCP请求成功率
 	tcpRTTsum  time.Duration // TCP请求延迟总和
 	tcpRTTmin  time.Duration // TCP请求最小延迟
@@ -271,88 +272,107 @@ func readIPs(filepath string) ([]string, error) {
 	return ips, nil
 }
 
+type tcpRes struct {
+	ip  string
+	rtt time.Duration
+	err error
+}
+
 // tcpOnce执行一次TCP拨号并返回持续时间
-func tcpOnce(ip string) (time.Duration, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), tcpTimeout)
-	defer cancel()
+func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) {
+	for ip := range ipChan {
+		// 创建一个带超时的 context
+		ctx, cancel := context.WithTimeout(context.Background(), tcpTimeout)
 
-	dialer := &net.Dialer{
-		Timeout:   tcpTimeout,
-		KeepAlive: 0, // 不保留链接，每次请求都建立一个新的TCP连接
+		// 创建一个带超时的 dialer
+		dialer := &net.Dialer{
+			Timeout:   tcpTimeout,
+			KeepAlive: 0, // 不保留链接，每次请求都建立一个新的TCP连接
+		}
+
+		// 使用自定义拨号器拨号
+		start := time.Now()
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
+		duration := time.Since(start)
+		if err != nil {
+			rspChan <- tcpRes{ip: ip, rtt: duration}
+		} else {
+			conn.Close()
+			rspChan <- tcpRes{ip: ip, err: err}
+		}
+		cancel()
+		wg.Done()
 	}
-
-	// 使用自定义拨号器拨号
-	start := time.Now()
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-
-	return time.Since(start), nil
 }
 
 // 对 IP 集合执行多轮 TCP 测试
 func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 	var wg sync.WaitGroup
-	thread := make(chan struct{}, *maxThreads)
+	jobChan := make(chan string, len(ips)**maxRetries)
+	respondChan := make(chan tcpRes, *maxThreads)
 
-	timef("开始执行 TCP连通性 测试, 共 %d 个目标\n", len(ips))
+	timef("TCP连通性 测试, 共 %d 个目标，每个目标%d次重试\n", len(ips), *maxRetries)
+	// 启动工作者
+	timef("正在启动 TCP worker\n")
+	for w := 0; w < *maxThreads; w++ {
+		go tcpWorker(jobChan, respondChan, &wg)
+	}
 
-	// 初始化用于统计响应信息的 map
-	aliveStats := make(map[string]*resultTCP)
-	var mu sync.Mutex // 保护 tcpStats 的互斥锁
-
+	timef("开始执行 TCP连通性 测试\n")
+	// 将ips复制maxRetries次到jobChan中
 	for retry := 0; retry < *maxRetries; retry++ {
 		for _, ip := range ips {
 			wg.Add(1)
-			thread <- struct{}{}
-			go func(ip string, retry int) {
-				defer func() {
-					<-thread
-					wg.Done()
-				}()
+			jobChan <- ip
+		}
+	}
+	go func() {
+		timef("正在等待 TCP连通性 测试结束...\n")
+		wg.Wait()
+		close(jobChan)
+		close(respondChan)
+		timef("TCP连通性 测试已结束，正在等待数据整理...\n")
+	}()
 
-				tcpRTT, err := tcpOnce(ip)
-				mu.Lock() // 加锁
-				if err == nil {
-					if _, exists := aliveStats[ip]; !exists {
-						aliveStats[ip] = &resultTCP{
-							// ip:        ip,
-							port:      *tcpPort,
-							tcpRTTmin: time.Duration(math.MaxInt64), // 初始化为最大值
-						}
-					}
-
-					stats := aliveStats[ip]
-					stats.tcpReach++
-					if tcpRTT < stats.tcpRTTmin {
-						stats.tcpRTTmin = tcpRTT
-					}
-					if tcpRTT > stats.tcpRTTmax {
-						stats.tcpRTTmax = tcpRTT
-					}
-					stats.tcpRTTsum += tcpRTT
-				} else {
-					fmt.Printf("[%s] TCP连接失败(第%d次): %v\n", ip, retry+1, err)
-				}
-				mu.Unlock() // 解锁
-			}(ip, retry)
+	// 从respondChan中读取结果并整理
+	// 初始化用于统计响应信息的 map
+	aliveStats := make(map[string]*resultTCP)
+	for rsd := range respondChan {
+		// 初始化统计信息
+		stat, exists := aliveStats[rsd.ip]
+		if !exists {
+			aliveStats[rsd.ip] = &resultTCP{
+				// ip:        ip,
+				port:      *tcpPort,
+				tcpRTTmin: time.Duration(math.MaxInt64), // 初始化为最大值
+			}
+			stat = aliveStats[rsd.ip]
+		}
+		if rsd.err == nil {
+			// 正常响应
+			stat.tcpReach++
+			if rsd.rtt < stat.tcpRTTmin {
+				stat.tcpRTTmin = rsd.rtt
+			}
+			if rsd.rtt > stat.tcpRTTmax {
+				stat.tcpRTTmax = rsd.rtt
+			}
+			stat.tcpRTTsum += rsd.rtt
+		} else {
+			// 响应超时
+			stat.tcpFailed++
+			fmt.Printf("[%s] TCP连接失败(第%d/共%d次): %v\n", rsd.ip, stat.tcpFailed, *maxRetries, rsd.err)
 		}
 	}
 
-	timef("正在等待 TCP 测试结束...\n")
-	wg.Wait()
-
-	timef("TCP 测试已结束，正在整理统计数据...\n")
+	// 记录无响应IP，计算有响应IP的平均响应时间
 	ipDead := []string{}
 	for _, ip := range ips {
-		stats, exists := aliveStats[ip]
-		if exists {
+		if stat, exists := aliveStats[ip]; exists {
 			// 有响应结果
-			if stats.tcpReach > 0 {
-				stats.tcpRTTavg = stats.tcpRTTsum / time.Duration(stats.tcpReach)
-				stats.reachRatio = float64(stats.tcpReach) / float64(*maxRetries) * 100
+			if stat.tcpReach > 0 {
+				stat.tcpRTTavg = stat.tcpRTTsum / time.Duration(stat.tcpReach)
+				stat.reachRatio = float64(stat.tcpReach) / float64(*maxRetries) * 100
 
 				// fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms\n",
 				// 	stats.ip, stats.reachRatio, stats.tcpRTTmin.Milliseconds(),
@@ -444,7 +464,6 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 				}
 				continue
 			}
-			defer resp.Body.Close()
 
 			duration := time.Since(startTime)
 
@@ -464,6 +483,7 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 				good = true
 				break
 			}
+			resp.Body.Close() // 关闭响应体
 		}
 		if !good {
 			// 全部超时
@@ -535,10 +555,10 @@ func httpTests(ips []string) map[string]*resultHTTP {
 			jobChan <- httpJob{ip, ori.port, ori.URL, "回源", false}
 		}
 	}
-
 	go func() {
 		timef("正在等待 HTTP 测试结束...\n")
 		wg.Wait()
+		close(jobChan)
 		close(respondChan)
 		timef("HTTP 测试已结束，正在等待数据整理...\n")
 	}()
