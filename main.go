@@ -30,7 +30,7 @@ const (
 	traceURL         = "https://speed.cloudflare.com/cdn-cgi/trace" // Cloudflare trace URL
 	UA               = "Mozilla/5.0"                                // User-Agent
 	limitCIDR        = 1024                                         // 单条CIDR最大长度限制
-	speedRetries     = 3                                            // 测速重试次数
+	speedRetries     = 3                                            // 速度测试重试次数
 )
 
 var (
@@ -38,7 +38,7 @@ var (
 	outFilePrefix = flag.String("xout", "result", "输出文件前缀")
 	tcpPort       = flag.Int("tcport", 443, "TCP测试端口")
 	maxThreads    = flag.Int("th", 100, "并发请求最大协程数")
-	doSpeedTest   = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")
+	doSpeedTest   = flag.Int("spdt", 0, "下载速度测试协程数量,设为0禁用速度测试")
 	speedTestURL  = flag.String("spdurl", "https://speed.cloudflare.com/__down?bytes=500000000", "测速文件地址")
 	originTestURL = flag.String("origin", "", "回源测试地址，支持英文逗号分隔的多个目标，默认留空禁用")
 	forceTLS      = flag.Bool("tls", false, "是否强制启用TLS")
@@ -413,22 +413,21 @@ func rectifyURL(oriURL string) (string, int) {
 }
 
 type httpJob struct {
-	ip          string
-	port        int
-	url         string
-	reqTag      string
-	needResBody bool
+	ip      string
+	port    int
+	url     string
+	reqTag  string // 请求标签
+	purpose string // 请求标的
 }
 
 type httpRes struct {
-	// 返回ip, RTT 和 body
-	// body可能是[]bytes.Buffer或[]byte
-	ip       string
-	url      string
-	reqTag   string
-	duration time.Duration
-	body     []byte
-	err      error
+	ip        string
+	url       string
+	reqTag    string
+	duration  time.Duration // HTTP请求的耗时
+	body      []byte        // 响应体内容
+	downSpeed float64       // 下载速度
+	err       error
 }
 
 func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.Request, jobChan <-chan httpJob, respondChan chan<- httpRes, wg *sync.WaitGroup) {
@@ -467,7 +466,8 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 
 			duration := time.Since(startTime)
 
-			if job.needResBody {
+			switch job.purpose {
+			case "body":
 				// 需要响应体，应该是trace请求
 				body, err := io.ReadAll(resp.Body)
 				if err != nil {
@@ -477,11 +477,16 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, body: body}
 				good = true
 				break
-			} else {
+			case "rttonly":
 				// 不需要响应体，应该是回源请求
 				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, url: job.url}
 				good = true
 				break
+			case "speed":
+				// 需要响应体长度，应该是测速请求
+				written, _ := io.Copy(io.Discard, resp.Body)
+				speed := float64(written) / duration.Seconds() / 1024
+				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, downSpeed: speed}
 			}
 			resp.Body.Close() // 关闭响应体
 		}
@@ -548,11 +553,11 @@ func httpTests(ips []string) map[string]*resultHTTP {
 	for _, ip := range ips {
 		wg.Add(jobPerIP)
 		// HTTP 测试
-		jobChan <- httpJob{ip, tracePort, rectifyTraceURL, "HTTP", true}
+		jobChan <- httpJob{ip, tracePort, rectifyTraceURL, "HTTP", "body"}
 
 		// 回源测试
 		for _, ori := range rectifyOriginURLs {
-			jobChan <- httpJob{ip, ori.port, ori.URL, "回源", false}
+			jobChan <- httpJob{ip, ori.port, ori.URL, "回源", "rttonly"}
 		}
 	}
 	go func() {
@@ -612,121 +617,54 @@ func httpTests(ips []string) map[string]*resultHTTP {
 	return resultMap
 }
 
-// 公共函数，用于创建 HTTP 客户端和请求
-func genClient(ip string, port int, url string, timeout time.Duration) (*http.Client, *http.Request, error) {
-	// 创建一个用于拨号的结构体
-	dialer := &net.Dialer{
-		Timeout:   tcpTimeout, // 设置超时时间
-		KeepAlive: 0,          // 关闭 keepalive
-	}
-	// 创建一个 http 传输结构体
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// 使用拨号结构体连接到指定的 ip 和端口
-			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
-		},
-	}
-	// 创建一个 http 客户端
-	client := &http.Client{
-		Transport: transport, // 设置传输结构体
-		Timeout:   timeout,   // 设置超时时间
-	}
-	// 创建一个 http 请求
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	// 设置请求头
-	req.Header.Set("User-Agent", UA)
-	// 关闭请求
-	req.Close = true
-	return client, req, nil
-}
-
-// 重构后的 speedOnce 函数
-func speedOnce(ip string) (float64, error) {
-	URL, port := rectifyURL(*speedTestURL)
-	for retry := 0; retry < speedRetries; retry++ {
-		startTime := time.Now()
-		client, req, err := genClient(ip, port, URL, downloadDuration)
-		if err != nil {
-			return 0, err
-		}
-
-		timef("启动 [%s:%d] 测速(第%d次)\n", ip, port, retry+1)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			timef("[%s:%d] 测速(第%d次)出错%v\n", ip, port, retry+1, err)
-			continue
-		}
-		defer resp.Body.Close()
-
-		written, _ := io.Copy(io.Discard, resp.Body)
-		duration := time.Since(startTime)
-		speed := float64(written) / duration.Seconds() / 1024
-		return speed, nil
-	}
-	return 0, fmt.Errorf("%d次重试均未成功", speedRetries)
-}
-
 // speedTests 对已经通过延迟测试的IP进行下载速度测试
 // 它使用goroutine并发进行测速，并通过channel返回结果
 // 过程中，调用reportProgress报告测试进度
 func speedTests(ips []string) []resultSpeed {
+	// 初始化请求集合
+	reqMap := new(requestMap)
+	reqMap.reqMap = make(map[string]*http.Request)
+
+	// 获得修整后的traceURL
+	rectifyspeedURL, speedPort := rectifyURL(*speedTestURL)
+	reqMap.appendRequest(rectifyspeedURL)
+
 	var wg sync.WaitGroup
-	thread := make(chan struct{}, *doSpeedTest)
+	jobChan := make(chan httpJob, len(ips))
+	respondChan := make(chan httpRes, *maxThreads)
+	// 启动工作者
+	timef("正在启动HTTP worker\n")
+	for w := 0; w < *maxThreads; w++ {
+		go httpWorker(downloadDuration, speedRetries, reqMap.reqMap, jobChan, respondChan, &wg)
+	}
 
-	// 创建 speedResultsChan 通道，用于存储 speedtestresult 结构体
-	speedResultsChan := make(chan resultSpeed, len(ips))
-	// 创建 progressChan 和 doneChan 通道，启动一个协程用于报告进度
-	progressChan := make(chan int, 1)
-	go func(progressChan chan int, total int) {
-		currentCount := 0
-		for count := range progressChan {
-			currentCount += count
-			percentage := float64(currentCount) / float64(total) * 100
-			timef("测速进度：%d / %d 已完成（%.2f%%）\r", currentCount, total, percentage)
-		}
-	}(progressChan, len(ips))
-
-	timef("开始执行 测速 测试\n")
+	timef("开始执行 速度 测试\n")
 	for _, ip := range ips {
 		wg.Add(1)
-		thread <- struct{}{}
-		go func(ip string) {
-			defer func() {
-				<-thread
-				wg.Done()
-			}()
-
-			speed, err := speedOnce(ip)
-			if err != nil {
-				fmt.Printf("[%s] 测速失败: %v\n", ip, err)
-			} else {
-				fmt.Printf("[%s] 测速结果: %.2f KB/s\n", ip, speed)
-				speedResultsChan <- resultSpeed{ip: ip, downSpeed: speed}
-			}
-
-			// 进度+1
-			progressChan <- 1
-		}(ip)
+		// HTTP 测试
+		jobChan <- httpJob{ip, speedPort, rectifyspeedURL, "速度", "speed"}
 	}
-
 	go func() {
-		timef("正在等待 测速 结束...\n")
+		timef("正在等待 速度 测试结束...\n")
 		wg.Wait()
-		close(speedResultsChan)
-		close(progressChan)
-		timef("测速已结束，正在统计数据...\n")
+		close(jobChan)
+		close(respondChan)
+		timef("速度 测试已结束，正在等待数据整理...\n")
 	}()
 
-	results := []resultSpeed{}
-	for speedResult := range speedResultsChan {
-		results = append(results, speedResult)
+	doneCount := 0
+	total := len(ips)
+	resultSlice := make([]resultSpeed, 0)
+	for res := range respondChan {
+		// 报告进度
+		doneCount++
+		percentage := float64(doneCount) / float64(total) * 100
+		timef("测速进度：%d / %d 已完成（%.2f%%）\r", doneCount, total, percentage)
+		// 记录结果
+		resultSlice = append(resultSlice, resultSpeed{ip: res.ip, downSpeed: res.downSpeed})
 	}
 
-	return results
+	return resultSlice
 }
 
 func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
