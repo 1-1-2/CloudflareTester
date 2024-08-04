@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -289,13 +290,12 @@ type tcpRes struct {
 
 // tcpWorker 执行TCP拨号并返回持续时间
 func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) {
+	// 创建一个带超时的 dialer
+	dialer := &net.Dialer{
+		Timeout:   timeoutTCP,
+		KeepAlive: -1, // If negative, keep-alive probes are disabled
+	}
 	for ip := range ipChan {
-		// 创建一个带超时的 dialer
-		dialer := &net.Dialer{
-			Timeout:   timeoutTCP,
-			KeepAlive: -1, // If negative, keep-alive probes are disabled
-		}
-
 		// 使用自定义拨号器拨号
 		start := time.Now()
 		conn, err := dialer.DialContext(context.Background(), "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
@@ -340,6 +340,25 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 		timef("TCP连通性 测试已结束，正在等待数据整理...\n")
 	}()
 
+	statSuccess := 0
+	statFailed := 0
+	doneChan := make(chan struct{})
+
+	// 每隔一秒报告进度
+	go func() {
+		for {
+			select {
+			case <-doneChan:
+				timef("TCP连通性 进度统计结束\n")
+				return
+			default:
+				time.Sleep(1 * time.Second)
+				percentage := float64(statSuccess+statFailed) / float64(len(ips)**retryTCP) * 100
+				timef("TCP连通性 测试进度: 成功%d / 超时%d（进度%.2f%%）\n", statSuccess, statFailed, percentage)
+			}
+		}
+	}()
+
 	// 从respondChan中读取结果并整理
 	// 初始化用于统计响应信息的 map
 	aliveStats := make(map[string]*resultTCP)
@@ -365,19 +384,23 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 				stat.tcpRTTmax = rsd.rtt
 			}
 			stat.tcpRTTsum += rsd.rtt
+			// fmt.Printf("[%s] TCP-RTT %dms (%d成功/%d失败)\n", rsd.ip, rsd.rtt.Milliseconds(), stat.tcpReach, stat.tcpFailed)
+			statSuccess++
 		} else {
 			// 响应超时
 			stat.tcpFailed++
-			fmt.Printf("[%s] TCP连接失败(%d成功/%d失败): %v\n", rsd.ip, stat.tcpReach, stat.tcpFailed, rsd.err)
+			// fmt.Printf("[%s] TCP连接失败 (%d成功/%d失败): %v\n", rsd.ip, stat.tcpReach, stat.tcpFailed, rsd.err)
+			statFailed++
 		}
 	}
+	close(doneChan)
 
 	// 记录无响应IP，计算有响应IP的平均响应时间
 	ipDead := []string{}
 	for _, ip := range ips {
 		if stat, exists := aliveStats[ip]; exists {
-			// 有响应结果
 			if stat.tcpReach > 0 {
+				// 有正常响应
 				stat.tcpRTTavg = stat.tcpRTTsum / time.Duration(stat.tcpReach)
 				stat.reachRatio = float64(stat.tcpReach) / float64(*retryTCP) * 100
 
@@ -385,12 +408,13 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 					ip, stat.reachRatio, stat.tcpRTTmin.Milliseconds(),
 					stat.tcpRTTavg.Milliseconds(), stat.tcpRTTmax.Milliseconds())
 			} else {
-				// 被记录的异常响应
-				timef("哪里出了错，%s 没有测试结果？\n", ip)
+				// 记录均超时
 				ipDead = append(ipDead, ip)
+				delete(aliveStats, ip)
 			}
 		} else {
-			// 没有响应结果
+			// 异常：没有记录
+			timef("哪里出了错，%s 没有测试结果？\n", ip)
 			ipDead = append(ipDead, ip)
 		}
 	}
@@ -834,6 +858,9 @@ func main() {
 		timef("读取文件时发生错误: %v\n", err)
 		return
 	}
+
+	// 随机打乱ips
+	rand.Shuffle(len(ips), func(i, j int) { ips[i], ips[j] = ips[j], ips[i] })
 
 	// 测试一：TCP测试
 	aliveStats, ipDead := tcpTests(ips)
