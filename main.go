@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -31,6 +30,7 @@ const (
 	traceURL         = "https://speed.cloudflare.com/cdn-cgi/trace" // Cloudflare trace URL
 	UA               = "Mozilla/5.0"                                // User-Agent
 	limitCIDR        = 1024                                         // 单条CIDR最大长度限制
+	speedRetries     = 3                                            // 速度测试重试次数
 )
 
 var (
@@ -38,11 +38,11 @@ var (
 	outFilePrefix = flag.String("xout", "result", "输出文件前缀")
 	tcpPort       = flag.Int("tcport", 443, "TCP测试端口")
 	maxThreads    = flag.Int("th", 100, "并发请求最大协程数")
-	doSpeedTest   = flag.Int("spdt", 0, "下载测速协程数量,设为0禁用测速")
+	doSpeedTest   = flag.Int("spdt", 0, "下载速度测试协程数量,设为0禁用速度测试")
 	speedTestURL  = flag.String("spdurl", "https://speed.cloudflare.com/__down?bytes=500000000", "测速文件地址")
 	originTestURL = flag.String("origin", "", "回源测试地址，支持英文逗号分隔的多个目标，默认留空禁用")
 	forceTLS      = flag.Bool("tls", false, "是否强制启用TLS")
-	maxAttempt    = flag.Int("attempt", 5, "最大重试次数")
+	maxRetries    = flag.Int("attempt", 5, "最大重试次数")
 	ipCounts      = 0                         // 读入的IP地址数量
 	startTime     = time.Now()                // 程序开始时间
 	locationMap   = make(map[string]location) // 机场码与地理位置的映射
@@ -50,9 +50,10 @@ var (
 )
 
 type resultTCP struct {
-	ip         string        // IP地址
+	// ip         string        // IP地址
 	port       int           // 端口
 	tcpReach   int           // TCP请求成功次数
+	tcpFailed  int           // TCP请求失败次数
 	reachRatio float64       // TCP请求成功率
 	tcpRTTsum  time.Duration // TCP请求延迟总和
 	tcpRTTmin  time.Duration // TCP请求最小延迟
@@ -61,12 +62,12 @@ type resultTCP struct {
 }
 
 type resultHTTP struct {
-	ip         string                   // IP地址
+	// ip         string                   // IP地址
 	dataCenter string                   // 数据中心
 	region     string                   // 地区
 	city       string                   // 城市
 	httpRTT    time.Duration            // HTTP请求延迟
-	originRTT  map[string]time.Duration // 回源测试延迟（多个目标）
+	originRTTs map[string]time.Duration // 回源测试延迟（多个目标）
 }
 
 type resultSpeed struct {
@@ -76,6 +77,7 @@ type resultSpeed struct {
 
 // 结果聚合
 type resultMerge struct {
+	ip string
 	resultTCP
 	resultHTTP
 	resultSpeed
@@ -188,7 +190,7 @@ func IPaddN(ip net.IP, n *big.Int) net.IP {
 func hasIPv6() bool {
 	publicDNS := "2400:3200::1" // 公共DNS的IPv6地址
 
-	for i := 1; i <= *maxAttempt; i++ {
+	for i := 1; i <= *maxRetries; i++ {
 		timef("通过 DOH 可达性检测 IPv6 连接，第 %d 次尝试...\n", i)
 		conn, err := net.DialTimeout("tcp6", net.JoinHostPort(publicDNS, "80"), httpTimeout)
 		if err != nil {
@@ -270,94 +272,112 @@ func readIPs(filepath string) ([]string, error) {
 	return ips, nil
 }
 
+type tcpRes struct {
+	ip  string
+	rtt time.Duration
+	err error
+}
+
 // tcpOnce执行一次TCP拨号并返回持续时间
-func tcpOnce(ip string) (time.Duration, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), tcpTimeout)
-	defer cancel()
+func tcpWorker(ipChan <-chan string, rspChan chan<- tcpRes, wg *sync.WaitGroup) {
+	for ip := range ipChan {
+		// 创建一个带超时的 context
+		ctx, cancel := context.WithTimeout(context.Background(), tcpTimeout)
 
-	dialer := &net.Dialer{
-		Timeout:   tcpTimeout,
-		KeepAlive: 0, // 不保留链接，每次请求都建立一个新的TCP连接
+		// 创建一个带超时的 dialer
+		dialer := &net.Dialer{
+			Timeout:   tcpTimeout,
+			KeepAlive: 0, // 不保留链接，每次请求都建立一个新的TCP连接
+		}
+
+		// 使用自定义拨号器拨号
+		start := time.Now()
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
+		duration := time.Since(start)
+		if err == nil {
+			conn.Close()
+			rspChan <- tcpRes{ip: ip, rtt: duration}
+		} else {
+			rspChan <- tcpRes{ip: ip, err: err}
+		}
+		cancel()
+		wg.Done()
 	}
-
-	// 使用自定义拨号器拨号
-	start := time.Now()
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(*tcpPort)))
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Close()
-
-	return time.Since(start), nil
 }
 
 // 对 IP 集合执行多轮 TCP 测试
-func tcpTests(ips []string) ([]resultTCP, []string) {
+func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 	var wg sync.WaitGroup
-	thread := make(chan struct{}, *maxThreads)
+	jobChan := make(chan string, len(ips)**maxRetries)
+	respondChan := make(chan tcpRes, *maxThreads)
 
-	timef("开始执行 TCP连通性 测试, 共 %d 个目标\n", len(ips))
+	timef("TCP连通性 测试, 共 %d 个目标，每个目标%d次重试\n", len(ips), *maxRetries)
+	// 启动工作者
+	timef("正在启动 TCP worker\n")
+	for w := 0; w < *maxThreads; w++ {
+		go tcpWorker(jobChan, respondChan, &wg)
+	}
 
-	// 初始化用于统计响应信息的 map
-	tcpStats := make(map[string]*resultTCP)
-	var mu sync.Mutex // 保护 tcpStats 的互斥锁
-
-	for attempts := 0; attempts < *maxAttempt; attempts++ {
+	timef("开始执行 TCP连通性 测试\n")
+	// 将ips复制maxRetries次到jobChan中
+	for retry := 0; retry < *maxRetries; retry++ {
 		for _, ip := range ips {
 			wg.Add(1)
-			thread <- struct{}{}
-			go func(ip string, attempts int) {
-				defer func() {
-					<-thread
-					wg.Done()
-				}()
+			jobChan <- ip
+		}
+	}
+	go func() {
+		timef("正在等待 TCP连通性 测试结束...\n")
+		wg.Wait()
+		close(jobChan)
+		close(respondChan)
+		timef("TCP连通性 测试已结束，正在等待数据整理...\n")
+	}()
 
-				tcpRTT, err := tcpOnce(ip)
-				mu.Lock() // 加锁
-				if err == nil {
-					if _, exists := tcpStats[ip]; !exists {
-						tcpStats[ip] = &resultTCP{
-							ip:        ip,
-							port:      *tcpPort,
-							tcpRTTmin: time.Duration(math.MaxInt64), // 初始化为最大值
-						}
-					}
-
-					stats := tcpStats[ip]
-					stats.tcpReach++
-					if tcpRTT < stats.tcpRTTmin {
-						stats.tcpRTTmin = tcpRTT
-					}
-					if tcpRTT > stats.tcpRTTmax {
-						stats.tcpRTTmax = tcpRTT
-					}
-					stats.tcpRTTsum += tcpRTT
-				} else {
-					fmt.Printf("[%s] TCP连接失败(第%d次): %v\n", ip, attempts+1, err)
-				}
-				mu.Unlock() // 解锁
-			}(ip, attempts)
+	// 从respondChan中读取结果并整理
+	// 初始化用于统计响应信息的 map
+	aliveStats := make(map[string]*resultTCP)
+	for rsd := range respondChan {
+		// 初始化统计信息
+		stat, exists := aliveStats[rsd.ip]
+		if !exists {
+			aliveStats[rsd.ip] = &resultTCP{
+				// ip:        ip,
+				port:      *tcpPort,
+				tcpRTTmin: time.Duration(math.MaxInt64), // 用最大值初始化
+			}
+			stat = aliveStats[rsd.ip]
+		}
+		// 根据响应更新统计信息
+		if rsd.err == nil {
+			// 正常响应
+			stat.tcpReach++
+			if rsd.rtt < stat.tcpRTTmin {
+				stat.tcpRTTmin = rsd.rtt
+			}
+			if rsd.rtt > stat.tcpRTTmax {
+				stat.tcpRTTmax = rsd.rtt
+			}
+			stat.tcpRTTsum += rsd.rtt
+		} else {
+			// 响应超时
+			stat.tcpFailed++
+			fmt.Printf("[%s] TCP连接失败(%d成功/%d失败): %v\n", rsd.ip, stat.tcpReach, stat.tcpFailed, rsd.err)
 		}
 	}
 
-	timef("正在等待 TCP 测试结束...\n")
-	wg.Wait()
-
-	timef("TCP 测试已结束，正在统计数据...\n")
-	resultAlive := []resultTCP{}
+	// 记录无响应IP，计算有响应IP的平均响应时间
 	ipDead := []string{}
 	for _, ip := range ips {
-		if _, exists := tcpStats[ip]; exists {
+		if stat, exists := aliveStats[ip]; exists {
 			// 有响应结果
-			stats := tcpStats[ip]
-			if stats.tcpReach > 0 {
-				stats.tcpRTTavg = stats.tcpRTTsum / time.Duration(stats.tcpReach)
-				stats.reachRatio = float64(stats.tcpReach) / float64(*maxAttempt) * 100
-				resultAlive = append(resultAlive, *stats)
+			if stat.tcpReach > 0 {
+				stat.tcpRTTavg = stat.tcpRTTsum / time.Duration(stat.tcpReach)
+				stat.reachRatio = float64(stat.tcpReach) / float64(*maxRetries) * 100
 
-				// fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms\n",
-				// 	stats.ip, stats.reachRatio, stats.tcpRTTmin.Milliseconds(),
-				// 	stats.tcpRTTavg.Milliseconds(), stats.tcpRTTmax.Milliseconds())
+				fmt.Printf("[%s] TCP Reach: %.2f%%, TCP-RTT min: %d ms, avg: %d ms, max: %d ms\n",
+					ip, stat.reachRatio, stat.tcpRTTmin.Milliseconds(),
+					stat.tcpRTTavg.Milliseconds(), stat.tcpRTTmax.Milliseconds())
 			} else {
 				// 被记录的异常响应
 				timef("哪里出了错，%s 没有测试结果？\n", ip)
@@ -369,12 +389,12 @@ func tcpTests(ips []string) ([]resultTCP, []string) {
 		}
 	}
 
-	timef("TCP 测试流程结束，与 %d 个IP中的 %d 个握手成功\n", ipCounts, len(resultAlive))
-	return resultAlive, ipDead
+	timef("TCP 测试流程结束，与 %d 个IP中的 %d 个握手成功\n", ipCounts, len(aliveStats))
+	return aliveStats, ipDead
 }
 
-// genURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
-func genURL(oriURL string) (string, int) {
+// rectifyURL 根据 oriURL 检查或添加正确的协议头，并返回端口号
+func rectifyURL(oriURL string) (string, int) {
 	if strings.HasPrefix(oriURL, "https://") {
 		return oriURL, 443
 	}
@@ -393,270 +413,266 @@ func genURL(oriURL string) (string, int) {
 	}
 }
 
-// 公共函数，用于创建 HTTP 客户端和请求
-func genClient(ip string, port int, url string) (*http.Client, *http.Request, error) {
+type httpJob struct {
+	ip      string
+	port    int
+	url     string
+	reqTag  string // 请求标签
+	purpose string // 请求标的
+}
+
+type httpRes struct {
+	ip        string
+	url       string
+	reqTag    string
+	duration  time.Duration // HTTP请求的耗时
+	body      []byte        // 响应体内容
+	downSpeed float64       // 下载速度
+	err       error
+}
+
+func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.Request, jobChan <-chan httpJob, respondChan chan<- httpRes, wg *sync.WaitGroup) {
 	// 创建一个用于拨号的结构体
 	dialer := &net.Dialer{
 		Timeout:   tcpTimeout, // 设置超时时间
 		KeepAlive: 0,          // 关闭 keepalive
 	}
-	// 创建一个 http 传输结构体
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// 使用拨号结构体连接到指定的 ip 和端口
-			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
-		},
-	}
-	// 创建一个 http 客户端
+	// 创建一个 http 客户端，使用默认的 Transport
+	transport := &http.Transport{DisableKeepAlives: true}
 	client := &http.Client{
-		Transport: transport,   // 设置传输结构体
-		Timeout:   httpTimeout, // 设置超时时间
+		Transport: transport, // 设置传输结构体
+		Timeout:   timeout,   // 设置超时时间
 	}
-	// 创建一个 http 请求
-	req, err := http.NewRequest("GET", url, nil)
+
+	for job := range jobChan {
+		// 设置请求的 IP 和端口
+		client.Transport.(*http.Transport).DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(job.ip, strconv.Itoa(job.port)))
+		}
+
+		good := false
+		for retry := 0; retry < limRetries; retry++ {
+			req := reqMAP[job.url]
+			startTime := time.Now()
+
+			resp, err := client.Do(req)
+			if err != nil {
+				if os.IsTimeout(err) {
+					fmt.Printf("[%s] %s请求(第%d次)超时: %v\n", job.ip, job.reqTag, retry+1, err)
+				} else {
+					fmt.Printf("[%s] %s请求(第%d次)失败: %v\n", job.ip, job.reqTag, retry+1, err)
+				}
+				continue
+			}
+
+			duration := time.Since(startTime)
+
+			// 按请求标的处理响应
+			switch job.purpose {
+			case "body":
+				// 需要响应体，应该是trace请求
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					fmt.Printf("[%s] %s请求(第%d次)读取响应体失败: %v\n", job.ip, job.reqTag, retry+1, err)
+					continue
+				}
+				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, body: body}
+			case "rttonly":
+				// 不需要响应体，应该是回源请求
+				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, duration: duration, url: job.url}
+			case "speed":
+				// 需要响应体长度，应该是测速请求
+				written, _ := io.Copy(io.Discard, resp.Body) // _:忽略大概率会有的超时提示
+				speed := float64(written) / duration.Seconds() / 1024
+				respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, downSpeed: speed}
+			}
+			// 走到这里的都是好请求，关闭响应体给个good，跳出循环
+			resp.Body.Close()
+			good = true
+			break
+		}
+		// 判断是break还是重试次数用尽
+		if !good {
+			// 全部超时
+			respondChan <- httpRes{ip: job.ip, reqTag: job.reqTag, err: fmt.Errorf("请求全部超时")}
+		} else {
+			// 重置标志
+			good = false
+		}
+		wg.Done()
+	}
+}
+
+type requestMap struct {
+	reqMap map[string]*http.Request
+}
+
+func (mp *requestMap) appendRequest(url string) {
+	// 创建一个 nobody http 请求
+	req, err := http.NewRequest("GET", url, http.NoBody)
 	if err != nil {
-		return nil, nil, err
+		timef("Worker创建HTTP.Request时出错: %v\n", err)
 	}
 	// 设置请求头
 	req.Header.Set("User-Agent", UA)
 	// 关闭请求
 	req.Close = true
-	return client, req, nil
-}
-
-// httpTraceOnce 执行官方节点测试并返回持续时间
-func httpTraceOnce(ip string) (time.Duration, *bytes.Buffer, error) {
-	URL, port := genURL(traceURL)
-	for attempts := 0; attempts < *maxAttempt; attempts++ {
-		startTime := time.Now()
-
-		client, req, err := genClient(ip, port, URL)
-		if err != nil {
-			return 0, nil, err
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			if os.IsTimeout(err) {
-				fmt.Printf("[%s] trace请求(第%d次)超时: %v\n", ip, attempts+1, err)
-			} else {
-				fmt.Printf("[%s] trace请求(第%d次)失败: %v\n", ip, attempts+1, err)
-			}
-			continue
-		}
-		defer resp.Body.Close()
-
-		duration := time.Since(startTime)
-		buf := &bytes.Buffer{}
-		_, err = io.Copy(buf, resp.Body)
-		if err != nil {
-			fmt.Printf("[%s] trace请求(第%d次)读取响应体失败: %v\n", ip, attempts+1, err)
-			continue
-		}
-
-		return duration, buf, nil
-	}
-	return 0, nil, fmt.Errorf("trace请求全部超时")
-}
-
-// httpOriginOnce 执行回源时间测试并返回持续时间
-func httpOriginOnce(ip string, oriURL string) (time.Duration, error) {
-	URL, port := genURL(oriURL)
-	for attempts := 0; attempts < *maxAttempt; attempts++ {
-		startTime := time.Now()
-		client, req, err := genClient(ip, port, URL)
-		if err != nil {
-			return 0, err
-		}
-		req.Body = http.NoBody // 不关注响应，设置请求体为空
-
-		resp, err := client.Do(req)
-		if err != nil {
-			if os.IsTimeout(err) {
-				fmt.Printf("[%s] 回源请求(第%d次)超时: %v\n", ip, attempts+1, err)
-			} else {
-				fmt.Printf("[%s] 回源请求(第%d次)失败: %v\n", ip, attempts+1, err)
-			}
-			continue
-		}
-		defer resp.Body.Close()
-
-		duration := time.Since(startTime)
-		return duration, nil
-	}
-	return 0, fmt.Errorf("回源请求全部超时")
+	mp.reqMap[url] = req
 }
 
 // HTTP 和回源测试部分
-func httpTests(ips []string) []resultHTTP {
-	var wg sync.WaitGroup
-	thread := make(chan struct{}, *maxThreads)
-	resultHTTPChan := make(chan resultHTTP, len(ips))
+func httpTests(ips []string) map[string]*resultHTTP {
+	// 初始化请求集合
+	reqMap := new(requestMap)
+	reqMap.reqMap = make(map[string]*http.Request)
 
-	re := regexp.MustCompile(`colo=([A-Z]+)`)
+	// 获得修整后的traceURL
+	rectifyTraceURL, tracePort := rectifyURL(traceURL)
+	reqMap.appendRequest(rectifyTraceURL)
+	type oriPair struct {
+		URL  string
+		port int
+	}
+	// 获得修整后的回源URL集合
+	rectifyOriginURLs := make([]oriPair, len(originURLs))
+	for i, url := range originURLs {
+		rectifyOriginURLs[i].URL, rectifyOriginURLs[i].port = rectifyURL(url)
+		originURLs[i] = rectifyOriginURLs[i].URL
+		reqMap.appendRequest(rectifyOriginURLs[i].URL)
+	}
+	jobPerIP := 1 + len(originURLs)
+
+	var wg sync.WaitGroup
+	jobChan := make(chan httpJob, len(ips)*jobPerIP)
+	respondChan := make(chan httpRes, *maxThreads)
+	// 启动工作者
+	timef("正在启动 HTTP worker\n")
+	for w := 0; w < *maxThreads; w++ {
+		go httpWorker(httpTimeout, *maxRetries, reqMap.reqMap, jobChan, respondChan, &wg)
+	}
 
 	timef("开始执行 HTTP和回源 测试\n")
 	for _, ip := range ips {
-		wg.Add(1)
-		thread <- struct{}{}
-		go func(ip string) {
-			defer func() {
-				<-thread
-				wg.Done()
-			}()
+		wg.Add(jobPerIP)
+		// HTTP 测试
+		jobChan <- httpJob{ip, tracePort, rectifyTraceURL, "HTTP", "body"}
 
-			// HTTP 测试
-			httpRTT, body, err := httpTraceOnce(ip)
-			if err != nil {
-				fmt.Printf("[%s] HTTP测试失败: %v\n", ip, err)
-			}
-
-			// 回源测试
-			originRTTs := make(map[string]time.Duration)
-			for _, url := range originURLs {
-				rtt, err := httpOriginOnce(ip, url)
-				if err != nil {
-					fmt.Printf("[%s] 回源(%s)测试失败: %v\n", ip, url, err)
-				} else {
-					originRTTs[url] = rtt
-				}
-			}
-
-			var dataCenter, region, city string
-			if matches := re.FindStringSubmatch(body.String()); len(matches) > 1 {
-				Colo := matches[1]
-				if loc, ok := locationMap[Colo]; ok {
-					dataCenter = Colo
-					region = loc.Region
-					city = loc.City
-				} else {
-					timef("未找到数据中心 %s 的位置信息\n", Colo)
-					dataCenter = Colo
-				}
-			}
-
-			result := resultHTTP{
-				ip:         ip,
-				dataCenter: dataCenter,
-				region:     region,
-				city:       city,
-				httpRTT:    httpRTT,
-				originRTT:  originRTTs,
-			}
-			resultHTTPChan <- result
-
-			fmt.Printf("[%s] HTTP-RTT %d ms，数据中心: %s, 地区: %s, 城市: %s",
-				ip, httpRTT.Milliseconds(), dataCenter, region, city)
-			for url, rtt := range originRTTs {
-				fmt.Printf(", 回源RTT(%s): %d ms", url, rtt.Milliseconds())
-			}
-			fmt.Println()
-		}(ip)
+		// 回源测试
+		for _, ori := range rectifyOriginURLs {
+			jobChan <- httpJob{ip, ori.port, ori.URL, "回源", "rttonly"}
+		}
 	}
-
 	go func() {
-		timef("正在等待 HTTP 测试结束...\n")
+		timef("任务队列构建完毕，正在等待 HTTP 测试结束...\n")
 		wg.Wait()
-		close(resultHTTPChan)
+		close(jobChan)
+		close(respondChan)
 		timef("HTTP 测试已结束，正在等待数据整理...\n")
 	}()
 
-	// resultHTTPChan 转切片
-	var resultHTTPSlice []resultHTTP
-	for res := range resultHTTPChan {
-		resultHTTPSlice = append(resultHTTPSlice, res)
-	}
-
-	return resultHTTPSlice
-}
-
-// 重构后的 speedOnce 函数
-func speedOnce(ip string) (float64, error) {
-	URL, port := genURL(*speedTestURL)
-	speedAttempts := 3
-	for attempts := 0; attempts < speedAttempts; attempts++ {
-		startTime := time.Now()
-		client, req, err := genClient(ip, port, URL)
-		if err != nil {
-			return 0, err
-		}
-		// 修改 client 的超时时间为 downloadDuration
-		client.Timeout = downloadDuration
-
-		timef("启动 [%s:%d] 测速(第%d次)\n", ip, port, attempts+1)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			timef("[%s:%d] 测速(第%d次)出错%v\n", ip, port, attempts+1, err)
+	// 从respondChan中读取结果并整理
+	var resultMap = make(map[string]*resultHTTP)
+	re := regexp.MustCompile(`colo=([A-Z]+)`)
+	for rsd := range respondChan {
+		if rsd.err != nil {
+			fmt.Printf("[%s] %s测试失败: %v\n", rsd.ip, rsd.reqTag, rsd.err)
 			continue
 		}
-		defer resp.Body.Close()
-
-		written, _ := io.Copy(io.Discard, resp.Body)
-		duration := time.Since(startTime)
-		speed := float64(written) / duration.Seconds() / 1024
-		return speed, nil
+		// 检出结果或初始化
+		result, exists := resultMap[rsd.ip]
+		if !exists {
+			// resultMap[rsd.ip] = resultHTTP{ip: rsd.ip}
+			resultMap[rsd.ip] = new(resultHTTP)
+			result = resultMap[rsd.ip]
+		}
+		// 根据请求类型处理结果输出
+		switch rsd.reqTag {
+		case "HTTP":
+			// 记录 dataCenter, region, city, httpRTT
+			result.httpRTT = rsd.duration
+			if matches := re.FindStringSubmatch(string(rsd.body)); len(matches) > 1 {
+				colo := matches[1]
+				result.dataCenter = colo
+				if loc, ok := locationMap[colo]; ok {
+					result.region = loc.Region
+					result.city = loc.City
+					fmt.Printf("[%s] HTTP-RTT %d ms，数据中心: %s, 地区: %s, 城市: %s\n",
+						rsd.ip, result.httpRTT.Milliseconds(), result.dataCenter, result.region, result.city)
+				} else {
+					fmt.Printf("[%s] HTTP-RTT %d ms，数据中心: %s，但未找到数据中心的位置信息\n",
+						rsd.ip, result.httpRTT.Milliseconds(), result.dataCenter)
+				}
+			}
+		case "回源":
+			if result.originRTTs == nil {
+				// 新增回源 RTT 记录
+				result.originRTTs = make(map[string]time.Duration)
+				result.originRTTs[rsd.url] = rsd.duration
+			} else {
+				// 增写回源 RTT 记录
+				result.originRTTs[rsd.url] = rsd.duration
+				fmt.Printf("[%s] 回源(%s)RTT: %d ms\n", rsd.ip, rsd.url, rsd.duration.Milliseconds())
+			}
+		}
 	}
-	return 0, fmt.Errorf("%d次重试均未成功", speedAttempts)
+
+	return resultMap
 }
 
 // speedTests 对已经通过延迟测试的IP进行下载速度测试
 // 它使用goroutine并发进行测速，并通过channel返回结果
 // 过程中，调用reportProgress报告测试进度
 func speedTests(ips []string) []resultSpeed {
+	// 初始化请求集合
+	reqMap := new(requestMap)
+	reqMap.reqMap = make(map[string]*http.Request)
+
+	// 获得修整后的traceURL
+	rectifyspeedURL, speedPort := rectifyURL(*speedTestURL)
+	reqMap.appendRequest(rectifyspeedURL)
+
 	var wg sync.WaitGroup
-	thread := make(chan struct{}, *doSpeedTest)
+	jobChan := make(chan httpJob, len(ips))
+	respondChan := make(chan httpRes, *maxThreads)
+	// 启动工作者
+	timef("正在启动 HTTP worker\n")
+	for w := 0; w < *maxThreads; w++ {
+		go httpWorker(downloadDuration, speedRetries, reqMap.reqMap, jobChan, respondChan, &wg)
+	}
 
-	// 创建 speedResultsChan 通道，用于存储 speedtestresult 结构体
-	speedResultsChan := make(chan resultSpeed, len(ips))
-	// 创建 progressChan 和 doneChan 通道，启动一个协程用于报告进度
-	progressChan := make(chan int, 1)
-	go func(progressChan chan int, total int) {
-		currentCount := 0
-		for count := range progressChan {
-			currentCount += count
-			percentage := float64(currentCount) / float64(total) * 100
-			timef("测速进度：%d / %d 已完成（%.2f%%）\r", currentCount, total, percentage)
-		}
-	}(progressChan, len(ips))
-
-	timef("开始执行 测速 测试\n")
+	timef("开始执行 速度 测试\n")
 	for _, ip := range ips {
 		wg.Add(1)
-		thread <- struct{}{}
-		go func(ip string) {
-			defer func() {
-				<-thread
-				wg.Done()
-			}()
-
-			speed, err := speedOnce(ip)
-			if err != nil {
-				fmt.Printf("[%s] 测速失败: %v\n", ip, err)
-			} else {
-				fmt.Printf("[%s] 测速结果: %.2f KB/s\n", ip, speed)
-				speedResultsChan <- resultSpeed{ip: ip, downSpeed: speed}
-			}
-
-			// 进度+1
-			progressChan <- 1
-		}(ip)
+		// HTTP 测试
+		jobChan <- httpJob{ip, speedPort, rectifyspeedURL, "测速", "speed"}
 	}
-
 	go func() {
-		timef("正在等待 测速 结束...\n")
+		timef("任务队列构建完毕，正在等待 速度 测试结束...\n")
 		wg.Wait()
-		close(speedResultsChan)
-		close(progressChan)
-		timef("测速已结束，正在统计数据...\n")
+		close(jobChan)
+		close(respondChan)
+		timef("速度 测试已结束，正在等待数据整理...\n")
 	}()
 
-	results := []resultSpeed{}
-	for speedResult := range speedResultsChan {
-		results = append(results, speedResult)
+	doneCount := 0
+	total := len(ips)
+	resultSlice := make([]resultSpeed, 0)
+	for rsd := range respondChan {
+		// 报告进度
+		doneCount++
+		percentage := float64(doneCount) / float64(total) * 100
+		timef("测速进度：%d / %d 已完成（%.2f%%）\n", doneCount, total, percentage)
+		// 记录结果
+		speed, err := rsd.downSpeed, rsd.err
+		if err != nil {
+			fmt.Printf("[%s] 测速失败: %v\n", rsd.ip, err)
+		} else {
+			fmt.Printf("[%s] 测速结果: %.2f KB/s\n", rsd.ip, speed)
+			resultSlice = append(resultSlice, resultSpeed{ip: rsd.ip, downSpeed: speed})
+		}
 	}
 
-	return results
+	return resultSlice
 }
 
 func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
@@ -685,7 +701,7 @@ func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 	for _, res := range results {
 		// 有响应的记录
 		record := []string{
-			res.resultTCP.ip,
+			res.ip,
 			strconv.Itoa(res.port),
 			strconv.FormatBool(*forceTLS),
 			res.dataCenter,
@@ -699,7 +715,7 @@ func resultsToCSV(results []resultMerge, tcpDead []string, outFileName string) {
 		}
 		// 回源 RTT 数据
 		for _, url := range originURLs {
-			if rtt, ok := res.originRTT[url]; ok {
+			if rtt, ok := res.originRTTs[url]; ok {
 				record = append(record, fmt.Sprintf("%d", rtt.Milliseconds()))
 			} else {
 				record = append(record, "N/A")
@@ -799,14 +815,14 @@ func main() {
 	}
 
 	// TCP测试
-	resultAlive, ipDead := tcpTests(ips)
+	aliveStats, ipDead := tcpTests(ips)
 	var ipAlive []string
-	for _, result := range resultAlive {
-		ipAlive = append(ipAlive, result.ip)
+	for ip := range aliveStats {
+		ipAlive = append(ipAlive, ip)
 	}
 
 	// HTTP和回源测试
-	resultHTTPSlice := httpTests(ipAlive)
+	resultHTTPMap := httpTests(ipAlive)
 
 	// 测速
 	var resultSpeedSlice []resultSpeed
@@ -814,31 +830,31 @@ func main() {
 		resultSpeedSlice = speedTests(ipAlive)
 	}
 
-	// 初始化 resultMap
-	resultMap := make(map[string]*resultMerge)
+	// 初始化 resultMergeMap
+	resultMergeMap := make(map[string]*resultMerge)
 	for _, ip := range ipAlive {
-		resultMap[ip] = &resultMerge{}
+		resultMergeMap[ip] = &resultMerge{ip: ip}
 	}
 
 	// resultMap <- TCP 测试结果
-	for _, res := range resultAlive {
-		resultMap[res.ip].resultTCP = res
+	for ip, res := range aliveStats {
+		resultMergeMap[ip].resultTCP = *res
 	}
 
 	// resultMap <- HTTP 测试结果
-	for _, res := range resultHTTPSlice {
-		resultMap[res.ip].resultHTTP = res
+	for ip, res := range resultHTTPMap {
+		resultMergeMap[ip].resultHTTP = *res
 
 	}
 
 	// resultMap <- 测速结果
 	for _, res := range resultSpeedSlice {
-		resultMap[res.ip].resultSpeed = res
+		resultMergeMap[res.ip].resultSpeed = res
 	}
 
 	// resultMap 转 slice，排序
 	var results []resultMerge
-	for _, res := range resultMap {
+	for _, res := range resultMergeMap {
 		results = append(results, *res)
 	}
 	if *doSpeedTest > 0 {
