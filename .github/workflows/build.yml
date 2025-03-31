@@ -91,7 +91,7 @@ jobs:
               fi
               mv "$FILE" "$tag_FILE"
             else
-              echo "::warning title=UPX compression::failed for $FILE, check if it's not supported"
+              echo "::warning title=UPX::$FILE could not be compressed further, it may not be supported."
             fi
           done
 
