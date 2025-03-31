@@ -58,9 +58,9 @@ var (
 type resultTCP struct {
 	// ip         string        // IP地址
 	port       int           // 端口
-	tcpReach   int           // TCP请求成功次数
-	tcpFailed  int           // TCP请求失败次数
-	reachRatio float64       // TCP请求成功率
+	tcpReach   int           // TCP请求响应次数
+	tcpFailed  int           // TCP请求超时次数
+	reachRatio float64       // TCP请求响应率
 	tcpRTTsum  time.Duration // TCP请求延迟总和
 	tcpRTTmin  time.Duration // TCP请求最小延迟
 	tcpRTTavg  time.Duration // TCP请求平均延迟
@@ -316,45 +316,42 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 	jobChan := make(chan string, len(ips)**retryTCP)
 	thisThread := min(*threadTCP, len(ips))
 	respondChan := make(chan tcpRes, thisThread)
+	timef("开始执行 TCP连通性 测试, 共 %d 个目标，每个目标%d次重试\n", len(ips), *retryTCP)
 
-	timef("TCP连通性 测试, 共 %d 个目标，每个目标%d次重试\n", len(ips), *retryTCP)
-	// 启动工作者
-	timef("正在启动 TCP worker\n")
+	// 启动多个 TCP worker 协程
 	for w := 0; w < thisThread; w++ {
 		go tcpWorker(jobChan, respondChan, &wg)
 	}
-
-	timef("开始执行 TCP连通性 测试\n")
-	// 将ips复制maxRetries次到jobChan中
+	// 构建任务队列，遍历ips切片maxRetries次，发送到jobChan通道
 	for retry := 0; retry < *retryTCP; retry++ {
 		for _, ip := range ips {
 			wg.Add(1)
 			jobChan <- ip
 		}
 	}
+	// 流程控制协程：等待所有任务完成，关闭jobChan，关闭respondChan
 	go func() {
-		timef("正在等待 TCP连通性 测试结束...\n")
+		timef("已启动 %d 个 TCP worker，任务队列构建完毕，正在等待 TCP连通性 测试结束...\n", thisThread)
 		wg.Wait()
 		close(jobChan)
 		close(respondChan)
-		timef("TCP连通性 测试已结束，正在等待数据整理...\n")
+		timef("TCP连通性 请求阶段完成，等待数据整理...\n")
 	}()
 
 	statSuccess := 0
 	statFailed := 0
 	doneChan := make(chan struct{})
 
-	// 每隔一秒报告进度
+	// 进度报告协程：每隔一秒报告进度
 	go func() {
 		for {
 			select {
 			case <-doneChan:
-				timef("TCP连通性 进度统计结束\n")
 				return
 			default:
-				time.Sleep(1 * time.Second)
 				percentage := float64(statSuccess+statFailed) / float64(len(ips)**retryTCP) * 100
-				timef("TCP连通性 测试进度: 成功%d / 超时%d（进度%.2f%%）\n", statSuccess, statFailed, percentage)
+				timef("TCP连通性 测试进度: 响应%d / 超时%d（进度%.2f%%）\n", statSuccess, statFailed, percentage)
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}()
@@ -384,18 +381,20 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 				stat.tcpRTTmax = rsd.rtt
 			}
 			stat.tcpRTTsum += rsd.rtt
-			// fmt.Printf("[%s] TCP-RTT %dms (%d成功/%d失败)\n", rsd.ip, rsd.rtt.Milliseconds(), stat.tcpReach, stat.tcpFailed)
+			// fmt.Printf("[%s] TCP-RTT %dms (%d响应/%d超时)\n", rsd.ip, rsd.rtt.Milliseconds(), stat.tcpReach, stat.tcpFailed)
 			statSuccess++
 		} else {
 			// 响应超时
 			stat.tcpFailed++
-			// fmt.Printf("[%s] TCP连接失败 (%d成功/%d失败): %v\n", rsd.ip, stat.tcpReach, stat.tcpFailed, rsd.err)
+			// fmt.Printf("[%s] TCP连接超时 (%d响应/%d超时): %v\n", rsd.ip, stat.tcpReach, stat.tcpFailed, rsd.err)
 			statFailed++
 		}
 	}
 	close(doneChan)
+	timef("TCP连通性 测试完成: 响应%d / 超时%d\n", statSuccess, statFailed)
 
 	// 记录无响应IP，计算有响应IP的平均响应时间
+	timef("TCP连通性 整理测试数据并输出统计行\n")
 	ipDead := []string{}
 	for _, ip := range ips {
 		if stat, exists := aliveStats[ip]; exists {
@@ -419,7 +418,7 @@ func tcpTests(ips []string) (map[string]*resultTCP, []string) {
 		}
 	}
 
-	timef("TCP 测试流程结束，与 %d 个IP中的 %d 个握手成功\n", len(ips), len(aliveStats))
+	timef("TCP 测试流程结束， (%d / %d) 个目标有响应\n", len(aliveStats), len(ips))
 	return aliveStats, ipDead
 }
 
@@ -492,7 +491,7 @@ func httpWorker(timeout time.Duration, limRetries int, reqMAP map[string]*http.R
 				if os.IsTimeout(err) {
 					fmt.Printf("[%s] %s请求(第%d次)超时: %v\n", job.ip, job.reqTag, retry+1, err)
 				} else {
-					fmt.Printf("[%s] %s请求(第%d次)失败: %v\n", job.ip, job.reqTag, retry+1, err)
+					fmt.Printf("[%s] %s请求(第%d次)超时: %v\n", job.ip, job.reqTag, retry+1, err)
 				}
 				continue
 			}
@@ -578,13 +577,13 @@ func httpTests(ips []string, locationMap map[string]location) map[string]*result
 	jobChan := make(chan httpJob, len(ips)*jobPerIP)
 	thisThread := min(*threadHTTP, len(ips))
 	respondChan := make(chan httpRes, thisThread)
-	// 启动工作者
-	timef("正在启动 HTTP worker\n")
+	timef("开始执行 HTTP和回源 测试\n")
+	// 启动多个 HTTP worker 协程
 	for w := 0; w < thisThread; w++ {
 		go httpWorker(timeoutHTTP, *retryHTTP, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
 
-	timef("开始执行 HTTP和回源 测试\n")
+	// 构建任务队列
 	for _, ip := range ips {
 		wg.Add(jobPerIP)
 		// HTTP 测试
@@ -596,11 +595,11 @@ func httpTests(ips []string, locationMap map[string]location) map[string]*result
 		}
 	}
 	go func() {
-		timef("任务队列构建完毕，正在等待 HTTP 测试结束...\n")
+		timef("已启动 %d 个 HTTP worker，任务队列构建完毕，正在等待 HTTP 测试结束...\n", thisThread)
 		wg.Wait()
 		close(jobChan)
 		close(respondChan)
-		timef("HTTP 测试已结束，正在等待数据整理...\n")
+		timef("HTTP测试 请求阶段完成\n")
 	}()
 
 	// 从respondChan中读取结果并整理
@@ -649,6 +648,7 @@ func httpTests(ips []string, locationMap map[string]location) map[string]*result
 		}
 	}
 
+	timef("HTTP测试 测试完成\n")
 	return resultMap
 }
 
@@ -668,20 +668,19 @@ func speedTests(ips []string) []resultSpeed {
 	jobChan := make(chan httpJob, len(ips))
 	thisThread := min(*threadSpeed, len(ips))
 	respondChan := make(chan httpRes, thisThread)
-	// 启动工作者
-	timef("正在启动 HTTP worker\n")
+	timef("开始执行 速度 测试\n")
+	// 启动多个 HTTP worker 协程
 	for w := 0; w < thisThread; w++ {
 		go httpWorker(timeDownload, *retrySpeed, reqMap.reqMap, jobChan, respondChan, &wg)
 	}
 
-	timef("开始执行 速度 测试\n")
 	for _, ip := range ips {
 		wg.Add(1)
 		// HTTP 测试
 		jobChan <- httpJob{ip, speedPort, rectifyspeedURL, "测速", "speed"}
 	}
 	go func() {
-		timef("任务队列构建完毕，正在等待 速度 测试结束...\n")
+		timef("已启动 %d 个 HTTP worker，任务队列构建完毕，正在等待 速度 测试结束...\n", thisThread)
 		wg.Wait()
 		close(jobChan)
 		close(respondChan)
