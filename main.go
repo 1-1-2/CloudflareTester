@@ -826,7 +826,7 @@ func main() {
 	fmt.Print("本次测试设置如下：\n")
 	fmt.Printf("回源测试目标: %v\n", *urlOrigin)
 	fmt.Printf("是否启用测速: %v\n", *threadSpeed > 0)
-	fmt.Printf("是否强制使用TLS: %v\n", *forceTLS)
+	fmt.Printf("是否强制使用TLS: %v，%v\n", *forceTLS, *urlSpeed)
 	fmt.Printf("TCP超时: %d ms，HTTP超时: %d ms，测速时间: %d s\n", *toTCP, *toHTTP, *tDown)
 	fmt.Printf("TCP并发: %d，HTTP并发: %d，测速并发: %d\n", *threadTCP, *threadHTTP, *threadSpeed)
 
